@@ -1,0 +1,47 @@
+name = "tier2tickets-relay"
+main = "src/index.ts"
+compatibility_date = "2024-11-27"
+compatibility_flags = ["nodejs_compat"]
+
+# Refresh the D1 mirror of Gorelo agents/clients every 6 hours (off the request path).
+# Tune as needed; syncAll() is idempotent.
+[triggers]
+crons = ["0 */6 * * *"]
+
+[vars]
+# US: https://api.usw.gorelo.io   AU: https://api.aue.gorelo.io
+GORELO_BASE_URL = "https://api.usw.gorelo.io"
+
+# When "true", only Tier2's two fixed source IPs (via CF-Connecting-IP) may POST tickets.
+ENFORCE_IP_ALLOWLIST = "true"
+
+# --- Gorelo IDs: fill these from scripts/gorelo-ids.sh ---
+# groupId / typeId / priorityId / sourceId are NON-NULLABLE on CreatePublicTicketCommand
+# and must always be sent, so these have no safe zero-default.
+DEFAULT_GROUP_ID = "0"      # GET /v1/organization/groups  -> pick the triage/service-desk group
+DEFAULT_TYPE_ID = "0"       # GET /v1/tickets/types         -> pick e.g. "Incident" / "Service Request"
+
+# PublicTicketPriority enum = [0,1,2,3,4]. Ships WITHOUT labels in the spec.
+# TODO(verify): confirm which int is your desired default priority in the Gorelo UI. 2 = a middle default.
+DEFAULT_PRIORITY = "2"
+
+# TicketSource enum = [1,2,3,4,5,6]. Ships WITHOUT labels in the spec.
+# TODO(verify): confirm which int maps to the "integration/portal/API" source in the Gorelo UI.
+DEFAULT_SOURCE = "4"
+
+# Fallback client when no machine/domain match is found. Fill from scripts/gorelo-ids.sh.
+CATCHALL_CLIENT_ID = "0"
+
+# --- Secrets (set via CLI, never committed) ---
+#   wrangler secret put GORELO_API_KEY   # X-API-Key for Gorelo (ticket write + asset/contact/client read scopes)
+#   wrangler secret put EXPECTED_KEY     # the "API key" Tier2 sends us in X-API-Key (gates ticket creation)
+#   wrangler secret put ADMIN_KEY        # gates POST /admin/sync (X-Admin-Key / X-API-Key / Authorization: Bearer)
+
+# --- D1 ---
+# Create once:  wrangler d1 create tier2tickets-relay
+# then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "tier2tickets-relay"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
