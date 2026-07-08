@@ -79,25 +79,9 @@ echo
 echo "=== Clients  (GET /v1/clients)  -> CATCHALL_CLIENT_ID + domain mirror ==="
 dump /v1/clients "${CLIENT_ROWS}"
 
-# --- Priority / source enum discovery -------------------------------------------------
-# PublicTicketPriority=[0..4] and TicketSource=[1..6] ship as integer enums WITHOUT labels.
-# Some tenants expose list endpoints (like types/statuses); probe the likely names. If they
-# 404, use the empirical fallback printed at the end.
 echo
-echo "=== Priorities (probe) -> DEFAULT_PRIORITY ==="
-for p in /v1/tickets/priorities /v1/tickets/priority; do
-  echo "-> GET ${p}"; dump "${p}" "${ROWS}"
-done
-
-echo
-echo "=== Sources (probe) -> DEFAULT_SOURCE ==="
-for p in /v1/tickets/sources /v1/tickets/source; do
-  echo "-> GET ${p}"; dump "${p}" "${ROWS}"
-done
-
-echo
-echo "If the priority/source probes 404, map the ints empirically:"
-echo "  1. Create a ticket in the Gorelo UI with the priority + source you want."
-echo "  2. Read it back:  curl -H \"X-API-Key: \$GORELO_API_KEY\" \\"
-echo "       \"${BASE_URL}/v1/tickets?take=1&sort=-id\" | jq '.[0] // .items[0] | {id, priorityId, sourceId}'"
-echo "  3. Use those integers for DEFAULT_PRIORITY / DEFAULT_SOURCE."
+echo "DEFAULT_PRIORITY / DEFAULT_SOURCE: the v1 spec ships PublicTicketPriority=[0..4]"
+echo "and TicketSource=[1..6] as bare int enums with NO labels, and exposes no list"
+echo "endpoint (nor a GET-ticket endpoint to read one back). Read the mapping off the"
+echo "New Ticket form in the Gorelo UI: the Priority (0..4) and Source (1..6) dropdown"
+echo "order gives the integer to use."
