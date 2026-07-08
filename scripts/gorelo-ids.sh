@@ -45,10 +45,15 @@ dump() {
     return
   fi
 
-  local rows
+  local rows err
+  # Surface jq errors (don't hide them) so a shape mismatch is obvious.
+  err="$(echo "${body}" | jq -r "${prog}" 2>&1 1>/dev/null || true)"
   rows="$(echo "${body}" | jq -r "${prog}" 2>/dev/null || true)"
+  if [[ -n "${err}" ]]; then
+    echo "  !! jq extraction error: ${err}"
+  fi
   if [[ -z "${rows}" || "${RAW:-}" == "1" ]]; then
-    echo "  (no rows matched the expected shape — raw JSON below; adjust the vars accordingly)"
+    echo "  (no rows extracted — raw JSON below; adjust the vars accordingly)"
     echo "${body}" | jq . | sed 's/^/    /'
   else
     echo "${rows}" | sed 's/^/    /'
@@ -56,10 +61,8 @@ dump() {
 }
 
 # Handles a bare array or an { items | data | results | value: [...] } envelope.
-ROWS='(if type=="array" then . else (.items // .data // .results // .value // []) end)
-      | .[] | "\(.id)\t\(.name)"'
-CLIENT_ROWS='(if type=="array" then . else (.items // .data // .results // .value // []) end)
-      | .[] | "\(.id)\t\(.name)\tdomains=\([.domains[]? | (.domain // .name)] | join(","))"'
+ROWS='(if type=="array" then . else (.items // .data // .results // .value // []) end) | .[] | "\(.id)\t\(.name)"'
+CLIENT_ROWS='(if type=="array" then . else (.items // .data // .results // .value // []) end) | .[] | "\(.id)\t\(.name)\tdomains=\([.domains[]? | (.domain // .name)] | join(","))"'
 
 echo "=== Groups  (GET /v1/organization/groups)  -> DEFAULT_GROUP_ID ==="
 dump /v1/organization/groups "${ROWS}"
