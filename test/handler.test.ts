@@ -1,18 +1,50 @@
-import { createExecutionContext, env, fetchMock, waitOnExecutionContext } from "cloudflare:test";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index.js";
 import { initSchema } from "../src/db.js";
 
 const GORELO = "https://api.usw.gorelo.io";
 const KEY = "test-expected-key";
 
-beforeAll(() => {
-  fetchMock.activate();
-  fetchMock.disableNetConnect();
-});
-afterEach(() => fetchMock.assertNoPendingInterceptors());
-afterAll(() => fetchMock.deactivate());
+// --- Outbound fetch stub -----------------------------------------------------
+// Tests share the workerd isolate with the imported worker, so replacing
+// globalThis.fetch intercepts the worker's Gorelo calls. This avoids depending
+// on the pool's mock-agent API (which has changed across versions).
+interface Route {
+  method: string;
+  match: (url: URL) => boolean;
+  handler: (req: Request) => Response | Promise<Response>;
+}
+let routes: Route[] = [];
+let realFetch: typeof fetch;
 
+beforeAll(() => {
+  realFetch = globalThis.fetch;
+});
+beforeEach(() => {
+  routes = [];
+});
+afterEach(() => {
+  globalThis.fetch = realFetch;
+});
+
+function installFetch(): void {
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const req = new Request(input as RequestInfo, init);
+    const url = new URL(req.url);
+    for (const r of routes) {
+      if (r.method === req.method && r.match(url)) return r.handler(req);
+    }
+    throw new Error(`unmocked fetch: ${req.method} ${req.url}`);
+  }) as typeof fetch;
+}
+const route = (method: string, match: (url: URL) => boolean, handler: Route["handler"]): void => {
+  routes.push({ method, match, handler });
+};
+const json = (status: number, data: unknown): Response =>
+  new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } });
+
+// --- D1 seeding --------------------------------------------------------------
 /** Seed the mirror and mark it synced so the first-press bootstrap is skipped. */
 async function seedSynced(devices: Array<[string, string, number, number, string]>): Promise<void> {
   await initSchema(env.DB);
@@ -47,24 +79,22 @@ async function dispatch(req: Request): Promise<Response> {
   return res;
 }
 
+const isContacts = (u: URL): boolean => u.pathname === "/v1/contacts";
+const isTickets = (u: URL): boolean => u.pathname === "/v1/tickets";
+
 describe("ticket create handler", () => {
   beforeEach(async () => {
     await seedSynced([["pc-01", "user@corp.com", 10, 100, "agent-abc"]]);
+    installFetch();
   });
 
   it("known machine -> 201 + ticket number, correct command mapping (JSON)", async () => {
-    const pool = fetchMock.get(GORELO);
-    pool
-      .intercept({ path: (p) => p.startsWith("/v1/contacts"), method: "GET" })
-      .reply(200, JSON.stringify([{ id: 55, primaryEmail: "user@corp.com", clientId: 10 }]));
-
+    route("GET", isContacts, () => json(200, [{ id: 55, primaryEmail: "user@corp.com", clientId: 10 }]));
     let posted: Record<string, unknown> | undefined;
-    pool
-      .intercept({ path: "/v1/tickets", method: "POST" })
-      .reply(201, (opts) => {
-        posted = JSON.parse(opts.body as string);
-        return JSON.stringify({ ticketNumber: "INC-42" });
-      });
+    route("POST", isTickets, async (req) => {
+      posted = (await req.json()) as Record<string, unknown>;
+      return json(201, { ticketNumber: "INC-42" });
+    });
 
     const body = JSON.stringify({
       name: "Jane Doe",
@@ -98,14 +128,11 @@ describe("ticket create handler", () => {
   });
 
   it("form-encoded body maps the same way", async () => {
-    const pool = fetchMock.get(GORELO);
-    pool
-      .intercept({ path: (p) => p.startsWith("/v1/contacts"), method: "GET" })
-      .reply(200, JSON.stringify([]));
+    route("GET", isContacts, () => json(200, []));
     let posted: Record<string, unknown> | undefined;
-    pool.intercept({ path: "/v1/tickets", method: "POST" }).reply(201, (opts) => {
-      posted = JSON.parse(opts.body as string);
-      return JSON.stringify({ number: "9001" });
+    route("POST", isTickets, async (req) => {
+      posted = (await req.json()) as Record<string, unknown>;
+      return json(201, { number: "9001" });
     });
 
     const form = new URLSearchParams({
@@ -122,14 +149,11 @@ describe("ticket create handler", () => {
   });
 
   it("unknown machine -> catch-all client with a triage note", async () => {
-    const pool = fetchMock.get(GORELO);
-    pool
-      .intercept({ path: (p) => p.startsWith("/v1/contacts"), method: "GET" })
-      .reply(200, JSON.stringify([]));
+    route("GET", isContacts, () => json(200, []));
     let posted: Record<string, unknown> | undefined;
-    pool.intercept({ path: "/v1/tickets", method: "POST" }).reply(201, (opts) => {
-      posted = JSON.parse(opts.body as string);
-      return JSON.stringify({ id: 12345 });
+    route("POST", isTickets, async (req) => {
+      posted = (await req.json()) as Record<string, unknown>;
+      return json(201, { id: 12345 });
     });
 
     const body = JSON.stringify({
@@ -147,11 +171,8 @@ describe("ticket create handler", () => {
   });
 
   it("Gorelo create failure -> 502", async () => {
-    const pool = fetchMock.get(GORELO);
-    pool
-      .intercept({ path: (p) => p.startsWith("/v1/contacts"), method: "GET" })
-      .reply(200, JSON.stringify([]));
-    pool.intercept({ path: "/v1/tickets", method: "POST" }).reply(500, "boom");
+    route("GET", isContacts, () => json(200, []));
+    route("POST", isTickets, () => new Response("boom", { status: 500 }));
 
     const body = JSON.stringify({ email: "user@corp.com", subject: "x", message: "y [[hdb host=pc-01]]" });
     const res = await dispatch(post(body, "application/json"));
@@ -167,30 +188,29 @@ describe("ticket create handler", () => {
 
   it("enforces the IP allowlist when enabled", async () => {
     const prev = env.ENFORCE_IP_ALLOWLIST;
-    (env as { ENFORCE_IP_ALLOWLIST: string }).ENFORCE_IP_ALLOWLIST = "true";
+    env.ENFORCE_IP_ALLOWLIST = "true";
     try {
       const body = JSON.stringify({ email: "user@corp.com", subject: "x", message: "y" });
       // No CF-Connecting-IP header -> not allowlisted.
       const res = await dispatch(post(body, "application/json"));
       expect(res.status).toBe(403);
     } finally {
-      (env as { ENFORCE_IP_ALLOWLIST: string }).ENFORCE_IP_ALLOWLIST = prev;
+      env.ENFORCE_IP_ALLOWLIST = prev;
     }
   });
 
   it("allows a whitelisted Tier2 source IP", async () => {
     const prev = env.ENFORCE_IP_ALLOWLIST;
-    (env as { ENFORCE_IP_ALLOWLIST: string }).ENFORCE_IP_ALLOWLIST = "true";
-    const pool = fetchMock.get(GORELO);
-    pool.intercept({ path: (p) => p.startsWith("/v1/contacts"), method: "GET" }).reply(200, "[]");
-    pool.intercept({ path: "/v1/tickets", method: "POST" }).reply(201, JSON.stringify({ ticketNumber: "OK-1" }));
+    env.ENFORCE_IP_ALLOWLIST = "true";
+    route("GET", isContacts, () => json(200, []));
+    route("POST", isTickets, () => json(201, { ticketNumber: "OK-1" }));
     try {
       const body = JSON.stringify({ email: "user@corp.com", subject: "x", message: "y [[hdb host=pc-01]]" });
       const res = await dispatch(post(body, "application/json", { "CF-Connecting-IP": "34.202.14.153" }));
       expect(res.status).toBe(201);
       expect(await res.text()).toBe("OK-1");
     } finally {
-      (env as { ENFORCE_IP_ALLOWLIST: string }).ENFORCE_IP_ALLOWLIST = prev;
+      env.ENFORCE_IP_ALLOWLIST = prev;
     }
   });
 });

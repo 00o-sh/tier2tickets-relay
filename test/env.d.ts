@@ -1,6 +1,10 @@
-import type { Env } from "../src/types.js";
+/// <reference types="@cloudflare/vitest-pool-workers/types" />
+import type { Env as WorkerEnv } from "../src/types.js";
 
-// Tell the vitest-pool-workers runtime the shape of `env` exposed by "cloudflare:test".
-declare module "cloudflare:test" {
-  interface ProvidedEnv extends Env {}
+// @cloudflare/vitest-pool-workers >=0.6 types `env` from "cloudflare:test" as
+// Cloudflare.Env. Augment it with this Worker's binding/var shape.
+declare global {
+  namespace Cloudflare {
+    interface Env extends WorkerEnv {}
+  }
 }
