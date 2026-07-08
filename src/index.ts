@@ -112,9 +112,20 @@ async function handleTicketCreate(request: Request, env: Env): Promise<Response>
       description,
     );
 
-    const raw = await client.createTicket(cmd);
-    // TODO(verify #3): pin the ticket-number field once confirmed. Log the raw
-    // response so the shape can be inspected on the first successful create.
+    let raw: unknown;
+    try {
+      raw = await client.createTicket(cmd);
+    } catch (err) {
+      // Gorelo's 400 validation errors return only a stack trace, not the failing
+      // field — so log the exact command we sent (no secrets) to diagnose it.
+      if (err instanceof GoreloError) {
+        console.error(
+          `gorelo create rejected status=${err.status} command=${JSON.stringify(cmd)} response=${err.body}`,
+        );
+      }
+      throw err;
+    }
+    // Log the raw response so the shape can be inspected on the first successful create.
     console.log("gorelo create response", JSON.stringify(raw));
     const ticketNumber = extractTicketNumber(raw);
 
