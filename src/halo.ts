@@ -513,10 +513,26 @@ async function resolveRouting(env: Env, t: HaloTicket): Promise<Routing> {
   };
 }
 
-const FIELD_MAX = 2000; // cap any single field so a base64 attachment can't bloat the ticket
+const FIELD_MAX = 2000; // cap any single extra field so one value can't bloat the ticket
+const BODY_MAX = 16000; // generous cap on the whole report body — keep everything, guard only pathological blobs
 
-function truncate(s: string): string {
-  return s.length > FIELD_MAX ? `${s.slice(0, FIELD_MAX)}… [truncated ${s.length - FIELD_MAX} chars]` : s;
+function truncate(s: string, max = FIELD_MAX): string {
+  return s.length > max ? `${s.slice(0, max)}… [truncated ${s.length - max} chars]` : s;
+}
+
+// Fields we already surface elsewhere (report body / dedicated handling), so they
+// don't need to appear again in the raw-fields dump.
+const DUMP_SKIP = new Set(["details_html", "details", "summary", "subject", "note_html", "note"]);
+
+/** Dump every remaining top-level field Tier2 sent, so nothing is silently lost. */
+function dumpSubmittedFields(t: HaloTicket): string {
+  const lines: string[] = [];
+  for (const [k, v] of Object.entries(t)) {
+    if (DUMP_SKIP.has(k) || v == null || v === "" || (Array.isArray(v) && v.length === 0)) continue;
+    const rendered = typeof v === "object" ? JSON.stringify(v) : String(v);
+    lines.push(`${k}: ${truncate(rendered)}`);
+  }
+  return lines.length ? ["— All submitted fields —", ...lines].join("\n") : "";
 }
 
 /** One-line hardware summary from the matched Gorelo agent (blank if no match). */
@@ -532,10 +548,10 @@ function deviceSection(d: DeviceFullRow | null): string {
   return parts.length ? `— Device —\n${parts.join(" · ")}` : "";
 }
 
-/** Build the ticket body: the report (flattened) + device details + routing trail. */
+/** Build the ticket body: the report + every submitted field + device details + routing. */
 function buildHaloDescription(t: HaloTicket, routing: Routing): string {
   const raw = str(t.details_html) || str(t.details) || str(t.summary);
-  const body = truncate(htmlToText(raw));
+  const body = truncate(htmlToText(raw), BODY_MAX);
 
   // The report body already shows reporter/company/hostname, so keep the trail to
   // just the routing outcome (which Gorelo ids we matched, and the asset status).
@@ -549,7 +565,9 @@ function buildHaloDescription(t: HaloTicket, routing: Routing): string {
     `Client: ${routing.clientId}  Contact: ${routing.contactId ?? "none"}  Asset: ${assetStatus}`,
   ].join("\n");
 
-  return [body, deviceSection(routing.device), trail].filter((s) => s.length > 0).join("\n\n");
+  return [body, dumpSubmittedFields(t), deviceSection(routing.device), trail]
+    .filter((s) => s.length > 0)
+    .join("\n\n");
 }
 
 /**
