@@ -21,6 +21,7 @@ export default defineConfig({
           EMERGENCY_PRIORITY: "1",
           GORELO_API_KEY: "test-gorelo-key",
           ADMIN_KEY: "test-admin-key",
+          DEAD_LETTER_WEBHOOK: "https://hooks.example.com/dead-letter",
           HALO_CLIENT_ID: "halo-test-id",
           HALO_CLIENT_SECRET: "halo-test-secret",
         },

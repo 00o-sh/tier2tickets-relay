@@ -873,7 +873,7 @@ function ticketNumberFromText(text: string): number | null {
  * ticket (explicit ticket id field, else the ticket number in the note text),
  * fold the note into the description, then create the Gorelo ticket.
  */
-async function handleActions(env: Env, body: string): Promise<Response> {
+async function handleActions(env: Env, ctx: ExecutionContext | undefined, body: string): Promise<Response> {
   const parsed = parseJson(body);
   const actions = (Array.isArray(parsed) ? parsed : [parsed]).filter(
     (a): a is Record<string, unknown> => a != null && typeof a === "object",
@@ -935,6 +935,9 @@ async function handleActions(env: Env, body: string): Promise<Response> {
     const attempts = pending.attempts + 1;
     if (attempts >= MAX_PENDING_ATTEMPTS) {
       console.error(`HALO dead-letter halo_id=${haloId} after ${attempts} attempts: ${String(err)}`);
+      const alert = postDeadLetter(env, { haloId, command: JSON.stringify(cmd), attempts, error: String(err) });
+      if (ctx) ctx.waitUntil(alert);
+      else await alert;
     } else {
       await putPendingTicket(env.DB, haloId, JSON.stringify(cmd), pending.created_at, attempts);
     }
@@ -943,6 +946,48 @@ async function handleActions(env: Env, body: string): Promise<Response> {
       return jsonResponse(502, { error: "gorelo_create_failed", status: err.status });
     }
     throw err;
+  }
+}
+
+/**
+ * A dead-lettered ticket is a lost help request, so (optionally) alert a webhook
+ * with enough detail for a human to recreate it. Slack-compatible (`text`) plus
+ * structured fields for generic consumers. Best-effort — never throws.
+ */
+async function postDeadLetter(
+  env: Env,
+  info: { haloId: number; command: string; attempts: number; error: string },
+): Promise<void> {
+  const url = env.DEAD_LETTER_WEBHOOK;
+  if (!url) return;
+  let cmd: Partial<CreatePublicTicketCommand> = {};
+  try {
+    cmd = JSON.parse(info.command) as CreatePublicTicketCommand;
+  } catch {
+    /* keep empty */
+  }
+  const text =
+    `⚠️ Helpdesk Buttons ticket dropped after ${info.attempts} failed Gorelo creates — ` +
+    `client=${cmd.clientId ?? "?"} contact=${cmd.contactId ?? "none"} · “${cmd.title ?? "(no title)"}” · ${info.error}`;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        text,
+        event: "hdb_dead_letter",
+        halo_id: info.haloId,
+        client_id: cmd.clientId ?? null,
+        contact_id: cmd.contactId ?? null,
+        location_id: cmd.locationId ?? null,
+        title: cmd.title ?? null,
+        attempts: info.attempts,
+        error: info.error,
+        description: cmd.description ?? null, // full ticket body, so it can be recreated
+      }),
+    });
+  } catch (e) {
+    console.error(`HALO dead-letter webhook failed halo_id=${info.haloId}: ${String(e)}`);
   }
 }
 
@@ -967,6 +1012,12 @@ export async function flushPendingTickets(env: Env): Promise<number> {
       const attempts = row.attempts + 1;
       if (attempts >= MAX_PENDING_ATTEMPTS) {
         console.error(`HALO dead-letter halo_id=${row.halo_id} after ${attempts} attempts: ${String(err)}`);
+        await postDeadLetter(env, {
+          haloId: row.halo_id,
+          command: row.command,
+          attempts,
+          error: String(err),
+        });
       } else {
         await putPendingTicket(env.DB, row.halo_id, row.command, row.created_at, attempts);
         console.error(`HALO orphan-flush failed halo_id=${row.halo_id} (attempt ${attempts}): ${String(err)}`);
@@ -994,7 +1045,7 @@ async function handleApi(
   }
   if (resource === "action" || resource === "actions") {
     // The note folds into the queued ticket, which is then created in Gorelo.
-    if (method === "POST") return handleActions(env, body);
+    if (method === "POST") return handleActions(env, ctx, body);
     return jsonResponse(200, []);
   }
   if (method === "GET") {

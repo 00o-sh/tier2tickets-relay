@@ -22,6 +22,8 @@ export interface Env {
   // secrets (wrangler secret put ...)
   GORELO_API_KEY: string; // X-API-Key sent to Gorelo
   ADMIN_KEY: string; // gates POST /admin/sync
+  // Optional webhook (Slack-compatible) alerted when a ticket is dead-lettered.
+  DEAD_LETTER_WEBHOOK?: string;
 
   // optional Halo mock OAuth credentials (Tier2's client_id/client_secret).
   // If both set, the token endpoint validates them; otherwise any creds are accepted.
