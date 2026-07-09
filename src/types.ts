@@ -18,13 +18,13 @@ export interface Env {
   HDB_TAG_ID?: string; // Gorelo tag id applied to every HDB ticket ("Submitted VIA HDB")
   EMERGENCY_PRIORITY?: string; // priority id for a press flagged "This is an emergency"
   DEBUG_LOGS?: string; // "true" enables verbose HALO CAPTURE/RESPONSE body logging (PII)
-  WEBHOOK_KIND?: string; // "teams" | "slack" — dead-letter alert format (auto-detected if unset)
 
   // secrets (wrangler secret put ...)
   GORELO_API_KEY: string; // X-API-Key sent to Gorelo
   ADMIN_KEY: string; // gates POST /admin/sync
-  // Optional webhook (Slack-compatible) alerted when a ticket is dead-lettered.
-  DEAD_LETTER_WEBHOOK?: string;
+  // Optional notifly (Apprise-style) URLs alerted when a ticket is dead-lettered.
+  // Comma/space/newline separated, e.g. "ntfy://alerts, msteams://…, slack://…".
+  NOTIFLY_URLS?: string;
 
   // optional Halo mock OAuth credentials (Tier2's client_id/client_secret).
   // If both set, the token endpoint validates them; otherwise any creds are accepted.

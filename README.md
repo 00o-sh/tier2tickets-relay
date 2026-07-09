@@ -130,10 +130,10 @@ single Gorelo ticket. A press whose note never arrives is created by an orphan
 flush (the `*/5 * * * *` cron, plus an opportunistic sweep off live requests)
 after `PENDING_GRACE_MS`. A command that keeps failing to create is **dead-lettered**
 (logged + dropped) after `MAX_PENDING_ATTEMPTS`, so it can't retry forever — and if
-`DEAD_LETTER_WEBHOOK` is set, a Slack-compatible alert is POSTed with the ticket detail
-(client/contact/title/description) so a tech can recreate the lost press. The payload
-is rendered for **Teams** (Adaptive Card) or **Slack** (text) — auto-detected from the
-webhook URL, or forced with `WEBHOOK_KIND`. Verify wiring anytime with
+`NOTIFLY_URLS` is set, an alert is sent via [notifly](https://github.com/ambersecurityinc/notifly)
+(Apprise-style URLs — ntfy / Teams / Slack / Discord / email / …) with the ticket
+detail (client/contact/title/description) so a tech can recreate the lost press. Set
+one or more comma/space-separated URLs; verify wiring anytime with
 `POST /admin/test-webhook`.
 
 **Reporter routing:** Tier2 files every press under the hardcoded

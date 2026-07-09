@@ -1,8 +1,7 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index.js";
-import { flushPendingTickets, haloResource, isHaloPath, webhookBody, webhookKind } from "../src/halo.js";
-import type { Env as WorkerEnv } from "../src/types.js";
+import { flushPendingTickets, haloResource, isHaloPath } from "../src/halo.js";
 import { initSchema } from "../src/db.js";
 import { assetNum } from "../src/sync.js";
 
@@ -94,28 +93,6 @@ describe("isHaloPath / haloResource", () => {
     expect(haloResource("/users")).toBe("users");
     expect(haloResource("/api/Users/123")).toBe("users");
     expect(haloResource("/token")).toBe("token");
-  });
-});
-
-describe("webhook format (Teams vs Slack)", () => {
-  const e = (kind = ""): WorkerEnv => ({ WEBHOOK_KIND: kind }) as WorkerEnv;
-
-  it("auto-detects Teams from the URL, Slack otherwise; WEBHOOK_KIND overrides", () => {
-    expect(webhookKind(e(), "https://prod-1.westus.logic.azure.com/workflows/abc/triggers/manual")).toBe("teams");
-    expect(webhookKind(e(), "https://tenant.webhook.office.com/webhookb2/abc")).toBe("teams");
-    expect(webhookKind(e(), "https://hooks.slack.com/services/abc")).toBe("slack");
-    expect(webhookKind(e("slack"), "https://tenant.webhook.office.com/x")).toBe("slack"); // override
-    expect(webhookKind(e("teams"), "https://hooks.slack.com/x")).toBe("teams"); // override
-  });
-
-  it("renders a Teams Adaptive Card vs a Slack text payload", () => {
-    const alert = { text: "hello", facts: [["Client", "10"] as [string, string]], body: "detail", extra: { event: "x" } };
-    const teams = JSON.parse(webhookBody("teams", alert));
-    expect(teams.type).toBe("message");
-    expect(teams.attachments[0].contentType).toBe("application/vnd.microsoft.card.adaptive");
-    expect(teams.attachments[0].content.type).toBe("AdaptiveCard");
-    const slack = JSON.parse(webhookBody("slack", alert));
-    expect(slack).toMatchObject({ text: "hello", event: "x" });
   });
 });
 
@@ -479,14 +456,14 @@ describe("Halo deferred ticket create (/tickets queues, /actions creates)", () =
     expect(cap.posted()).toMatchObject({ priorityId: 2 }); // DEFAULT_PRIORITY
   });
 
-  it("dead-letters a queued ticket after MAX_PENDING_ATTEMPTS + alerts the webhook", async () => {
+  it("dead-letters a queued ticket after MAX_PENDING_ATTEMPTS + alerts via notifly", async () => {
     // Gorelo create keeps failing.
     routes.push({
       method: "POST",
       match: (u) => u.pathname === "/v1/tickets",
       handler: () => json(500, { error: "boom" }),
     });
-    // Capture the dead-letter webhook POST.
+    // Capture the notifly delivery (jsons:// -> POST https://hooks.example.com/dead-letter).
     let alert: Record<string, unknown> | undefined;
     routes.push({
       method: "POST",
@@ -507,19 +484,13 @@ describe("Halo deferred ticket create (/tickets queues, /actions creates)", () =
     // Dropped, not re-queued.
     const row = await env.DB.prepare(`SELECT halo_id FROM pending_tickets WHERE halo_id = 9999`).first();
     expect(row).toBeNull();
-    // Webhook alerted with recreate-able detail.
-    expect(alert).toMatchObject({
-      event: "hdb_dead_letter",
-      halo_id: 9999,
-      client_id: 10,
-      contact_id: 55,
-      title: "Doomed",
-      attempts: 5,
-    });
-    expect(String(alert?.text)).toContain("dropped after 5");
+    // notifly alerted (webhook payload = {title, body, ...}); body carries recreate detail.
+    expect(String(alert?.title)).toContain("dropped after 5");
+    expect(String(alert?.body)).toContain("Doomed");
+    expect(String(alert?.body)).toContain("Client: 10");
   });
 
-  it("POST /admin/test-webhook fires a test alert and reports the webhook status", async () => {
+  it("POST /admin/test-webhook fires a test alert via notifly and reports results", async () => {
     let alert: Record<string, unknown> | undefined;
     routes.push({
       method: "POST",
@@ -531,8 +502,8 @@ describe("Halo deferred ticket create (/tickets queues, /actions creates)", () =
     });
     const res = await req("/admin/test-webhook", { method: "POST", headers: { "X-Admin-Key": "test-admin-key" } });
     expect(res.status).toBe(200);
-    expect(await res.text()).toBe("webhook responded 200");
-    expect(alert).toMatchObject({ event: "hdb_dead_letter_test" });
+    expect(await res.text()).toBe("notifly: 1 ok, 0 failed");
+    expect(String(alert?.title)).toContain("Helpdesk Buttons");
   });
 
   it("POST /admin/test-webhook requires the admin key", async () => {

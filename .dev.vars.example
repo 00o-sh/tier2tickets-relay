@@ -7,10 +7,11 @@ GORELO_API_KEY="your-gorelo-api-key"
 # Gates POST /admin/sync (sent as X-Admin-Key, X-API-Key, or Authorization: Bearer).
 ADMIN_KEY="another-long-random-secret"
 
-# Optional: Slack-compatible webhook POSTed when a queued ticket is dead-lettered
-# (dropped after MAX_PENDING_ATTEMPTS failed Gorelo creates). Payload carries the
-# ticket detail so a tech can recreate it. Leave unset to only log the drop.
-# DEAD_LETTER_WEBHOOK="https://hooks.slack.com/services/..."
+# Optional: notifly (Apprise-style) URL(s) alerted when a queued ticket is
+# dead-lettered (dropped after MAX_PENDING_ATTEMPTS failed Gorelo creates). One or
+# more, comma/space separated. Leave unset to only log the drop.
+# e.g. ntfy://alerts  |  msteams://group@tenant/channel/webhook  |  slack://a/b/c/%23chan
+# NOTIFLY_URLS="ntfy://my-hdb-alerts"
 
 # Optional: Halo mock OAuth credentials. If both are set, the /token endpoint
 # validates the client_id/client_secret Tier2 sends; otherwise any creds are accepted
