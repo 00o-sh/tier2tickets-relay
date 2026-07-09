@@ -410,10 +410,17 @@ export async function handleHalo(request: Request, env: Env): Promise<Response> 
     return jsonResponse(403, { error: "forbidden" });
   }
 
-  if (url.pathname === "/auth/token" || url.pathname === "/token") {
-    return handleToken(request, env, url, body);
+  // Always return decodable JSON: Tier2's Halo client fails hard ("could not
+  // decode json from the response") on any non-JSON body, so no error may escape
+  // as an HTML/text 500.
+  try {
+    if (url.pathname === "/auth/token" || url.pathname === "/token") {
+      return await handleToken(request, env, url, body);
+    }
+    await ensureSynced(env);
+    return await handleApi(request, env, url, body);
+  } catch (err) {
+    console.error(`HALO handler error ${request.method} ${url.pathname}:`, String(err));
+    return jsonResponse(500, { error: "internal_error", detail: String(err).slice(0, 300) });
   }
-
-  await ensureSynced(env);
-  return handleApi(request, env, url, body);
 }

@@ -65,9 +65,11 @@ export async function initSchema(db: D1Database): Promise<void> {
   ]);
 
   // Additive migration: a devices table created before Phase 2 lacks the new
-  // columns, and CREATE TABLE IF NOT EXISTS won't add them. Add any missing ones.
-  const info = await db.prepare(`PRAGMA table_info(devices)`).all<{ name: string }>();
-  const existing = new Set((info.results ?? []).map((r) => r.name));
+  // columns, and CREATE TABLE IF NOT EXISTS won't add them. Try to add each; a
+  // "duplicate column name" error (column already present) is expected and
+  // ignored. We attempt the ALTER unconditionally rather than trusting PRAGMA,
+  // because PRAGMA table_info behaves differently across D1 builds — a false
+  // "missing" reading there previously crashed the request with a 500.
   const newColumns: Record<string, string> = {
     asset_num: "INTEGER",
     display_name: "TEXT",
@@ -77,11 +79,17 @@ export async function initSchema(db: D1Database): Promise<void> {
     os: "TEXT",
   };
   for (const [col, type] of Object.entries(newColumns)) {
-    if (!existing.has(col)) {
+    try {
       await db.prepare(`ALTER TABLE devices ADD COLUMN ${col} ${type}`).run();
+    } catch {
+      // column already exists — fine
     }
   }
-  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_devices_asset_num ON devices (asset_num)`).run();
+  try {
+    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_devices_asset_num ON devices (asset_num)`).run();
+  } catch {
+    // index already exists / column race — fine
+  }
 }
 
 // --- Matcher lookups (osTicket path) ----------------------------------------
