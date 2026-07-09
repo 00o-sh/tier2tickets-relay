@@ -136,16 +136,35 @@ Flow (routed by path, so it coexists with the osTicket path — untouched):
 | `GET /api/Client` / `GET /api/Site` | Gorelo **clients** / **locations** from the mirror |
 | `GET /api/Asset?search={hostname}` | the Gorelo **agent/device** (numeric surrogate id ↔ agent UUID) |
 | `GET /api/TicketType\|Status\|Team\|Priority\|Agent` | minimal default lists (from env) |
-| `POST /api/Tickets` | maps client/site/user/asset ids + **all** submitted fields into a Gorelo ticket, returns a Halo-shaped created ticket (`gorelo_ticket_id` carries the real UUID) |
-| `POST /api/Actions` | accepted + logged (Gorelo's public API has no ticket-note endpoint) |
+| `POST /api/Tickets` | builds the Gorelo command and **queues** it (keyed by the Halo id returned); does NOT create the ticket yet |
+| `POST /api/Actions` | folds the note into the queued command, then **creates** the Gorelo ticket (correlated by explicit `ticket_id`, else the ticket number parsed from the note text) |
+
+**Deferred create:** Tier2 posts the ticket, then posts the report/notification as a
+separate `/actions` note — but Gorelo has no ticket-append endpoint. So the `/tickets`
+call queues the command in `pending_tickets` and the `/actions` note is merged before
+the single Gorelo create. A press whose note never arrives is created note-less by an
+orphan flush (the `*/5 * * * *` cron, plus an opportunistic sweep off live requests)
+after `PENDING_GRACE_MS`.
+
+**Reporter routing:** Tier2 files every press under the hardcoded
+`unregistered@helpdeskbuttons.com` user → the catch-all client, so the real identity
+lives only in the `details_html` "Report Summary" table. The Worker parses it and
+resolves the actual Gorelo **contact** (by reporter email) and **asset/client** (by
+hostname); the ids Tier2 sends are used only as a last-resort fallback. (Contact
+linking still requires that reporter to be a synced Gorelo contact.)
 
 **ID mapping:** Halo `client_id`/`site_id`/`user_id` *are* the Gorelo client / location
 / contact ids (the lookups return them). Assets use a deterministic numeric surrogate
 of the agent UUID (`asset_num`, stored in D1), mapped back on create.
 
-**Max data:** the ticket create dumps every field Tier2 sends (categories, custom
-fields, priority/team/type, selections, identity, …) into the Gorelo description —
-we slim this down once we see real submissions.
+**Tagging:** every HDB ticket gets the Gorelo tag `HDB_TAG_ID` (31974 "Submitted VIA
+HDB") via `tagIds`, for filtering/reporting. This is a tag, not the ticket type
+(`DEFAULT_TYPE_ID` stays 7045 "Incident").
+
+**Attachments (screenshots / diagnostic data):** NOT captured. Gorelo's public API has
+no attachment/file endpoint, and we don't yet handle Tier2's upload call — those files
+are currently dropped. Preserving them would require capturing the upload, storing it
+(e.g. R2), and linking it in the description.
 
 **Mirror:** `syncAll()` now also mirrors **clients, sites, and contacts** (per-client,
 bounded concurrency) so the Halo lookups are fast point reads; the first Halo `/api/*`

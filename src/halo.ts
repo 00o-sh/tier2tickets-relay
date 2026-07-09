@@ -1,5 +1,6 @@
 import {
   findContactByEmail,
+  findDeviceByHostname,
   getAgentIdByAssetNum,
   getClientName,
   getContactById,
@@ -7,12 +8,16 @@ import {
   initSchema,
   listClientRows,
   listLocationRows,
+  putPendingTicket,
   searchContactRows,
   searchDeviceRows,
+  takePendingTicket,
+  takeStalePendingTickets,
   type ContactRow,
+  type DeviceRow,
 } from "./db.js";
 import { GoreloClient, GoreloError, extractTicketNumber } from "./gorelo.js";
-import { normalizeEmail } from "./parse.js";
+import { normalizeEmail, normalizeHost } from "./parse.js";
 import { assetNum, syncAll } from "./sync.js";
 import { ipAllowed } from "./tier2.js";
 import type {
@@ -305,7 +310,7 @@ function handleConfig(env: Env, resource: string): Response {
   }
 }
 
-// --- Ticket create (POST /api/Tickets) --------------------------------------
+// --- Ticket create (POST /tickets) + note (POST /actions) -------------------
 
 type HaloTicket = Record<string, unknown>;
 
@@ -315,15 +320,79 @@ function firstTicket(parsed: unknown): HaloTicket {
   return {};
 }
 
+function parseJson(body: string): unknown {
+  try {
+    return JSON.parse(body);
+  } catch {
+    return {};
+  }
+}
+
 const str = (v: unknown): string => (typeof v === "string" ? v : v == null ? "" : String(v));
 const num = (v: unknown): number | null => {
   const n = typeof v === "number" ? v : Number(v);
   return Number.isFinite(n) && n !== 0 ? n : null;
 };
 
-/** Pull the requester email out of the various fields Halo/Tier2 might use. */
+// Deferred-create grace: how long a queued /tickets command waits for its
+// /actions note before the cron orphan-flush creates it note-less. Tier2 posts
+// the action ~1s after the ticket, so this is a generous safety margin.
+const PENDING_GRACE_MS = 5 * 60 * 1000;
+
+const nowIso = (): string => new Date().toISOString();
+
+// --- HTML report parsing ----------------------------------------------------
+// Tier2 files every press under the hardcoded `unregistered@helpdeskbuttons.com`
+// user (-> our synthetic id + catch-all client). The REAL reporter identity is
+// only in the "Report Summary" table inside details_html, so we parse it out to
+// resolve the actual Gorelo contact/company/asset.
+
+function stripTags(s: string): string {
+  return s.replace(/<[^>]*>/g, " ");
+}
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'");
+}
+function htmlToText(s: string): string {
+  return decodeEntities(stripTags(s)).replace(/[ \t]+\n/g, "\n").replace(/[ \t]{2,}/g, " ").trim();
+}
+
+/** Extract the `<td>Label:</td><td>Value</td>` pairs from the report table. */
+function parseReport(html: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!html) return out;
+  const re = /<td[^>]*>\s*([^<:]+?)\s*:\s*<\/td>\s*<td[^>]*>\s*([\s\S]*?)\s*<\/td>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const label = m[1]!.trim().toLowerCase();
+    const value = decodeEntities(stripTags(m[2]!)).trim();
+    if (label && value && !(label in out)) out[label] = value;
+  }
+  return out;
+}
+
+const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
+
+/** The reporter email: the labeled report field first, else the first non-catch-all address. */
+function reportEmail(report: Record<string, string>, html: string): string {
+  const labeled = normalizeEmail(report.email ?? "");
+  if (labeled.includes("@") && labeled !== HALO_UNREGISTERED_EMAIL) return labeled;
+  for (const m of html.matchAll(EMAIL_RE)) {
+    const e = normalizeEmail(m[0]);
+    if (e && e !== HALO_UNREGISTERED_EMAIL) return e;
+  }
+  return "";
+}
+
+/** Pull the requester email out of the explicit fields Halo/Tier2 might use. */
 function requesterEmail(t: HaloTicket): string {
-  for (const k of ["emailfrom", "reportedby", "email", "useremail", "contactemail"]) {
+  for (const k of ["emailfrom", "reportedby", "emailaddress", "email", "useremail", "contactemail"]) {
     const v = normalizeEmail(str(t[k]));
     if (v.includes("@")) return v;
   }
@@ -333,22 +402,81 @@ function requesterEmail(t: HaloTicket): string {
 /** Map the asset ids Tier2 sends (our numeric surrogates) back to Gorelo agent UUIDs. */
 async function resolveAssetUuids(db: D1Database, t: HaloTicket): Promise<string[]> {
   const ids: number[] = [];
-  const assets = t.assets;
-  if (Array.isArray(assets)) {
-    for (const a of assets) {
-      if (typeof a === "number") ids.push(a);
-      else if (a && typeof a === "object") {
-        const n = num((a as Record<string, unknown>).id);
-        if (n != null) ids.push(n);
+  for (const key of ["assets", "asset_id", "assetid", "asset"]) {
+    const v = t[key];
+    if (typeof v === "number") ids.push(v);
+    else if (Array.isArray(v)) {
+      for (const a of v) {
+        if (typeof a === "number") ids.push(a);
+        else if (a && typeof a === "object") {
+          const n = num((a as Record<string, unknown>).id);
+          if (n != null) ids.push(n);
+        }
       }
+    } else if (v != null) {
+      const n = num(v);
+      if (n != null) ids.push(n);
     }
   }
   const uuids: string[] = [];
   for (const n of ids) {
     const uuid = await getAgentIdByAssetNum(db, n);
-    if (uuid) uuids.push(uuid);
+    if (uuid && !uuids.includes(uuid)) uuids.push(uuid);
   }
   return uuids;
+}
+
+/** Resolved Gorelo routing for a press. */
+interface Routing {
+  clientId: number;
+  locationId: number | null;
+  contactId: number | null;
+  contactName: string;
+  agentAssetIds: string[];
+  email: string;
+  report: Record<string, string>;
+}
+
+async function resolveRouting(env: Env, t: HaloTicket): Promise<Routing> {
+  const html = str(t.details_html) || str(t.details);
+  const report = parseReport(html);
+  const email = requesterEmail(t) || reportEmail(report, html);
+  const hostname = normalizeHost(report.hostname ?? "");
+
+  // Contact: a real user_id first (the synthetic unregistered id resolves to
+  // nothing), then the reporter email parsed from the report.
+  let contact: ContactRow | null = null;
+  const uid = num(t.user_id);
+  if (uid && uid !== HALO_UNREGISTERED_USER_ID) contact = await getContactById(env.DB, uid);
+  if (!contact && email) contact = await findContactByEmail(env.DB, email);
+
+  // Device by hostname (from the report) — an agent asset link plus a
+  // client/location fallback when the email didn't resolve a contact.
+  let device: DeviceRow | null = null;
+  if (hostname) device = await findDeviceByHostname(env.DB, hostname);
+
+  const bodyClient = num(t.client_id);
+  const isCatchall = bodyClient === Number(env.CATCHALL_CLIENT_ID);
+  // Most specific signal wins: matched contact, matched device, a NON-catch-all
+  // client Tier2 sent, then whatever remains (catch-all).
+  const clientId =
+    contact?.client_id ??
+    device?.client_id ??
+    (bodyClient && !isCatchall ? bodyClient : null) ??
+    bodyClient ??
+    Number(env.CATCHALL_CLIENT_ID);
+  const locationId = contact?.location_id ?? device?.location_id ?? num(t.site_id) ?? null;
+  const contactId = contact?.id ?? null;
+
+  const agentAssetIds = await resolveAssetUuids(env.DB, t);
+  if (device?.agent_id && !agentAssetIds.includes(device.agent_id)) agentAssetIds.push(device.agent_id);
+
+  const contactName = contact?.name || report.name || email || "Helpdesk Buttons";
+  console.log(
+    `HALO routing: reportEmail=${email || "(none)"} hostname=${hostname || "(none)"} ` +
+      `contact=${contactId ?? "MISS"} device=${device ? "hit" : "miss"} -> client=${clientId} location=${locationId ?? "none"}`,
+  );
+  return { clientId, locationId, contactId, contactName, agentAssetIds, email, report };
 }
 
 const FIELD_MAX = 2000; // cap any single field so a base64 attachment can't bloat the ticket
@@ -357,112 +485,187 @@ function truncate(s: string): string {
   return s.length > FIELD_MAX ? `${s.slice(0, FIELD_MAX)}… [truncated ${s.length - FIELD_MAX} chars]` : s;
 }
 
-/** Build a rich description: the body plus a dump of every field Tier2 sent. */
-function buildHaloDescription(t: HaloTicket, email: string): string {
-  const body = truncate((str(t.details_html) || str(t.details) || str(t.summary)).trim());
+/** Build the ticket body: the report (HTML flattened to text) + resolution trail. */
+function buildHaloDescription(t: HaloTicket, routing: Routing): string {
+  const raw = str(t.details_html) || str(t.details) || str(t.summary);
+  const body = truncate(htmlToText(raw));
 
-  const skip = new Set(["details", "details_html"]);
-  const extras: string[] = [];
-  for (const [k, v] of Object.entries(t)) {
-    if (skip.has(k) || v == null || v === "" || (Array.isArray(v) && v.length === 0)) continue;
-    const rendered = typeof v === "object" ? JSON.stringify(v) : String(v);
-    extras.push(`${k}: ${truncate(rendered)}`);
-  }
-  if (email) extras.push(`resolved_requester: ${email}`);
+  const trail: string[] = [];
+  if (routing.email) trail.push(`Reporter: ${routing.email}`);
+  if (routing.report.name) trail.push(`Name: ${routing.report.name}`);
+  if (routing.report["business name"]) trail.push(`Company: ${routing.report["business name"]}`);
+  if (routing.report.hostname) trail.push(`Hostname: ${routing.report.hostname}`);
+  trail.push(`Routed to Gorelo client=${routing.clientId} contact=${routing.contactId ?? "none"}`);
 
-  const footer = ["--- Helpdesk Buttons / Halo submission ---", ...extras].join("\n");
+  const footer = ["--- Helpdesk Buttons submission ---", ...trail].join("\n");
   return [body, footer].filter((s) => s.length > 0).join("\n\n");
 }
 
-async function handleCreateTicket(env: Env, body: string): Promise<Response> {
-  const parsed = ((): unknown => {
-    try {
-      return JSON.parse(body);
-    } catch {
-      return {};
-    }
-  })();
-  const t = firstTicket(parsed);
-  const email = requesterEmail(t);
-
-  // Resolve the Gorelo routing. Prefer the ids Tier2 looked up (they ARE Gorelo
-  // ids in our mock); fall back to the contact resolved from the email.
-  const contact = num(t.user_id)
-    ? await getContactById(env.DB, num(t.user_id) as number)
-    : email
-      ? await findContactByEmail(env.DB, email)
-      : null;
-
-  const clientId = num(t.client_id) ?? contact?.client_id ?? Number(env.CATCHALL_CLIENT_ID);
-  const locationId = num(t.site_id) ?? contact?.location_id ?? null;
-  const contactId = contact?.id ?? null;
-  const agentAssetIds = await resolveAssetUuids(env.DB, t);
-
+function buildTicketCommand(env: Env, t: HaloTicket, routing: Routing): CreatePublicTicketCommand {
   const summary = str(t.summary) || str(t.subject) || "(no subject)";
-  const description = buildHaloDescription(t, email);
-
-  const cmd: CreatePublicTicketCommand = {
+  const tagId = num(env.HDB_TAG_ID);
+  return {
     title: summary,
-    createdByName: contact?.name || email || "Helpdesk Buttons",
-    clientId,
-    locationId,
-    contactId,
-    description,
+    createdByName: routing.contactName,
+    clientId: routing.clientId,
+    locationId: routing.locationId,
+    contactId: routing.contactId,
+    description: buildHaloDescription(t, routing),
     statusId: Number(env.DEFAULT_STATUS_ID),
     groupId: Number(env.DEFAULT_GROUP_ID),
     typeId: Number(env.DEFAULT_TYPE_ID),
     priorityId: Number(env.DEFAULT_PRIORITY) as PublicTicketPriority,
     sourceId: Number(env.DEFAULT_SOURCE) as TicketSource,
-    agentAssetIds,
+    tagIds: tagId ? [tagId] : undefined,
+    agentAssetIds: routing.agentAssetIds,
     sendTicketCreatedEmail: false,
   };
+}
 
-  const client = new GoreloClient(env);
-  let raw: unknown;
+/**
+ * POST /tickets — Tier2 creates the ticket, then POSTs the report/notification as
+ * a separate /actions note. Gorelo has no ticket-append endpoint, so we DON'T
+ * create the Gorelo ticket yet: we build the command, queue it keyed by the Halo
+ * id we return, and let the /actions note fold in before the create. An orphan
+ * flush (cron + opportunistic) creates any ticket whose note never arrives.
+ */
+async function handleCreateTicket(env: Env, ctx: ExecutionContext | undefined, body: string): Promise<Response> {
+  const t = firstTicket(parseJson(body));
+  const routing = await resolveRouting(env, t);
+  const cmd = buildTicketCommand(env, t, routing);
+
+  const haloId = assetNum(crypto.randomUUID()) || Date.now() % 1_000_000_000_000;
+  await putPendingTicket(env.DB, haloId, JSON.stringify(cmd), nowIso());
+  console.log(
+    `HALO queued ticket halo_id=${haloId} client=${routing.clientId} contact=${routing.contactId} assets=${routing.agentAssetIds.length}`,
+  );
+
+  // Opportunistically flush older orphans in the background (no-op when empty).
+  ctx?.waitUntil(flushPendingTickets(env).catch((e) => console.error("HALO opportunistic flush failed", String(e))));
+
+  // Echo a Halo-shaped created ticket so Tier2 can display/correlate it.
+  return jsonResponse(201, {
+    id: haloId,
+    summary: cmd.title,
+    details: str(t.details),
+    client_id: routing.clientId,
+    site_id: routing.locationId ?? 0,
+    user_id: routing.contactId ?? 0,
+    tickettype_id: Number(env.DEFAULT_TYPE_ID),
+    status_id: Number(env.DEFAULT_STATUS_ID),
+  });
+}
+
+/** Parse "...ticket number 264274883401817..." out of a note's text. */
+function ticketNumberFromText(text: string): number | null {
+  const m = /ticket\s*(?:number|#|no\.?)?\s*[:#]?\s*(\d{6,})/i.exec(text);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * POST /actions — the report/notification note. Correlate it to the queued
+ * ticket (explicit ticket id field, else the ticket number in the note text),
+ * fold the note into the description, then create the Gorelo ticket.
+ */
+async function handleActions(env: Env, body: string): Promise<Response> {
+  const parsed = parseJson(body);
+  const actions = (Array.isArray(parsed) ? parsed : [parsed]).filter(
+    (a): a is Record<string, unknown> => a != null && typeof a === "object",
+  );
+
+  let haloId: number | null = null;
+  const noteParts: string[] = [];
+  for (const a of actions) {
+    haloId = haloId ?? num(a.ticket_id) ?? num(a.ticketid) ?? num(a.ticket) ?? num(a.request_id);
+    const note = str(a.note_html) || str(a.note) || str(a.details_html) || str(a.details) || str(a.outcome);
+    if (note) noteParts.push(note);
+  }
+  const noteText = noteParts.join("\n\n");
+  if (haloId == null) haloId = ticketNumberFromText(noteText);
+
+  const actionId = assetNum(crypto.randomUUID()) || Date.now() % 1_000_000_000;
+
+  if (haloId == null) {
+    console.log("HALO action with no correlatable ticket id — accepted, nothing to attach");
+    return jsonResponse(201, [{ id: actionId }]);
+  }
+
+  const pending = await takePendingTicket(env.DB, haloId);
+  if (!pending) {
+    // Already created (duplicate/late action) or unknown ticket — accept, no dup.
+    console.log(`HALO action halo_id=${haloId}: no pending to attach — accepted`);
+    return jsonResponse(201, [{ id: actionId, ticket_id: haloId }]);
+  }
+
+  const cmd = JSON.parse(pending.command) as CreatePublicTicketCommand;
+  const noteBody = truncate(htmlToText(noteText));
+  if (noteBody) cmd.description = `${cmd.description}\n\n--- Follow-up note (Helpdesk Buttons) ---\n${noteBody}`;
+
   try {
-    raw = await client.createTicket(cmd);
+    const raw = await new GoreloClient(env).createTicket(cmd);
+    const uuid = extractTicketNumber(raw) ?? "";
+    console.log(
+      `HALO created gorelo ticket ${uuid} from action (halo_id=${haloId} client=${cmd.clientId} contact=${cmd.contactId})`,
+    );
+    return jsonResponse(201, [{ id: actionId, ticket_id: haloId, gorelo_ticket_id: uuid }]);
   } catch (err) {
+    // Re-queue so the orphan flush retries; surface the failure to Tier2.
+    await putPendingTicket(env.DB, haloId, JSON.stringify(cmd), pending.created_at);
     if (err instanceof GoreloError) {
-      console.error(
-        `HALO gorelo create rejected status=${err.status} command=${JSON.stringify(cmd)} response=${err.body}`,
-      );
+      console.error(`HALO action gorelo create rejected status=${err.status} response=${err.body}`);
       return jsonResponse(502, { error: "gorelo_create_failed", status: err.status });
     }
     throw err;
   }
+}
 
-  const uuid = extractTicketNumber(raw) ?? "";
-  const id = assetNum(uuid) || Date.now() % 1_000_000_000;
-  console.log(`HALO created gorelo ticket ${uuid} -> halo id ${id} (client=${clientId} contact=${contactId})`);
-
-  // Echo a Halo-shaped created ticket so Tier2 can display/correlate it.
-  return jsonResponse(201, {
-    id,
-    summary,
-    details: str(t.details),
-    client_id: clientId,
-    site_id: locationId ?? 0,
-    user_id: contactId ?? 0,
-    tickettype_id: Number(env.DEFAULT_TYPE_ID),
-    status_id: Number(env.DEFAULT_STATUS_ID),
-    gorelo_ticket_id: uuid,
-  });
+/**
+ * Create any queued tickets whose /actions note never arrived (older than the
+ * grace window). Runs from the cron and opportunistically off live requests.
+ */
+export async function flushPendingTickets(env: Env): Promise<number> {
+  const cutoff = new Date(Date.now() - PENDING_GRACE_MS).toISOString();
+  const stale = await takeStalePendingTickets(env.DB, cutoff);
+  if (!stale.length) return 0;
+  const client = new GoreloClient(env);
+  let created = 0;
+  for (const row of stale) {
+    try {
+      const cmd = JSON.parse(row.command) as CreatePublicTicketCommand;
+      const raw = await client.createTicket(cmd);
+      const uuid = extractTicketNumber(raw) ?? "";
+      created++;
+      console.log(`HALO orphan-flush created gorelo ticket ${uuid} (halo_id=${row.halo_id})`);
+    } catch (err) {
+      await putPendingTicket(env.DB, row.halo_id, row.command, row.created_at);
+      console.error(`HALO orphan-flush failed halo_id=${row.halo_id}: ${String(err)}`);
+    }
+  }
+  return created;
 }
 
 // --- Router -----------------------------------------------------------------
 
-async function handleApi(request: Request, env: Env, url: URL, body: string): Promise<Response> {
+async function handleApi(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext | undefined,
+  url: URL,
+  body: string,
+): Promise<Response> {
   const resource = haloResource(url.pathname);
   const method = request.method;
 
   if (resource === "ticket" || resource === "tickets") {
-    if (method === "POST") return handleCreateTicket(env, body);
+    if (method === "POST") return handleCreateTicket(env, ctx, body);
     return jsonResponse(200, { tickets: [], record_count: 0 });
   }
   if (resource === "action" || resource === "actions") {
-    // Gorelo's public API has no ticket-note endpoint, so accept + log only.
-    console.log("HALO action (note/attachment) accepted — no Gorelo note endpoint");
-    return jsonResponse(201, [{ id: Date.now() % 1_000_000_000 }]);
+    // The note folds into the queued ticket, which is then created in Gorelo.
+    if (method === "POST") return handleActions(env, body);
+    return jsonResponse(200, []);
   }
   if (method === "GET") {
     if (resource === "users") return handleUsers(env, url);
@@ -483,7 +686,11 @@ async function ensureSynced(env: Env): Promise<void> {
   }
 }
 
-export async function handleHalo(request: Request, env: Env): Promise<Response> {
+export async function handleHalo(
+  request: Request,
+  env: Env,
+  ctx?: ExecutionContext,
+): Promise<Response> {
   const url = new URL(request.url);
   const body = await logCapture(request, url);
 
@@ -501,7 +708,7 @@ export async function handleHalo(request: Request, env: Env): Promise<Response> 
       res = await handleToken(request, env, url, body);
     } else {
       await ensureSynced(env);
-      res = await handleApi(request, env, url, body);
+      res = await handleApi(request, env, ctx, url, body);
     }
   } catch (err) {
     console.error(`HALO handler error ${request.method} ${url.pathname}:`, String(err));

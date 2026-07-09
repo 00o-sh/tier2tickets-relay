@@ -1,7 +1,7 @@
 import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import worker from "../src/index.js";
-import { haloResource, isHaloPath } from "../src/halo.js";
+import { flushPendingTickets, haloResource, isHaloPath } from "../src/halo.js";
 import { initSchema } from "../src/db.js";
 import { assetNum } from "../src/sync.js";
 
@@ -41,6 +41,7 @@ async function seed(): Promise<void> {
     env.DB.prepare(`DELETE FROM contacts`),
     env.DB.prepare(`DELETE FROM devices`),
     env.DB.prepare(`DELETE FROM sync_meta`),
+    env.DB.prepare(`DELETE FROM pending_tickets`),
   ]);
   await env.DB.batch([
     env.DB.prepare(`INSERT INTO clients (id, name) VALUES (10, 'Corp'), (999, 'Salient MSP')`),
@@ -177,72 +178,185 @@ describe("Halo lookups (Gorelo-backed)", () => {
   });
 });
 
-describe("Halo ticket create -> Gorelo", () => {
-  it("maps looked-up ids + rich data into a Gorelo ticket", async () => {
-    let posted: Record<string, unknown> | undefined;
-    routes.push({
-      method: "POST",
-      match: (u) => u.pathname === "/v1/tickets",
-      handler: async (r) => {
-        posted = (await r.json()) as Record<string, unknown>;
-        return json(200, { ticketId: "cb83b6cf-959c-4eed-afb8-ba3e18a3c53a" });
-      },
-    });
+// A minimal Tier2 "Report Summary" table (the real payload embeds the reporter
+// identity here, not in the Halo user_id, which is the catch-all).
+const reportHtml = (opts: { email?: string; host?: string; name?: string; company?: string }): string =>
+  `<table><tbody>
+     <tr><td style="font-weight:600;">Name:</td><td>${opts.name ?? "Eli Brody"}</td></tr>
+     ${opts.email ? `<tr><td style="font-weight:600;">Email:</td><td>${opts.email}</td></tr>` : ""}
+     ${opts.company ? `<tr><td style="font-weight:600;">Business Name:</td><td>${opts.company}</td></tr>` : ""}
+     ${opts.host ? `<tr><td style="font-weight:600;">Hostname:</td><td>${opts.host}</td></tr>` : ""}
+   </tbody></table>`;
 
-    const res = await req("/api/Tickets", {
+/** Capture the single Gorelo create call (returns a fixed ticket uuid). */
+function captureGoreloCreate(uuid = "cb83b6cf-959c-4eed-afb8-ba3e18a3c53a"): {
+  posted: () => Record<string, unknown> | undefined;
+} {
+  let posted: Record<string, unknown> | undefined;
+  routes.push({
+    method: "POST",
+    match: (u) => u.pathname === "/v1/tickets",
+    handler: async (r) => {
+      posted = (await r.json()) as Record<string, unknown>;
+      return json(200, { ticketId: uuid });
+    },
+  });
+  return { posted: () => posted };
+}
+
+describe("Halo deferred ticket create (/tickets queues, /actions creates)", () => {
+  it("does NOT create the Gorelo ticket on /tickets — it queues it", async () => {
+    const cap = captureGoreloCreate();
+    const res = await req("/tickets", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "halo-app-name": "tier2tech" },
+      body: JSON.stringify([{ summary: "Printer down", details_html: reportHtml({ email: "user@corp.com" }) }]),
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(typeof body.id).toBe("number");
+    // Deferred: nothing posted to Gorelo yet.
+    expect(cap.posted()).toBeUndefined();
+    // The command is queued for its note.
+    const row = await env.DB.prepare(`SELECT command FROM pending_tickets WHERE halo_id = ?`)
+      .bind(body.id)
+      .first<{ command: string }>();
+    expect(row).not.toBeNull();
+  });
+
+  it("creates the Gorelo ticket when the /actions note arrives, folding in the note", async () => {
+    const cap = captureGoreloCreate();
+    const created = await req("/tickets", {
+      method: "POST",
+      headers: { "content-type": "application/json", "halo-app-name": "tier2tech" },
       body: JSON.stringify([
         {
           summary: "Printer down",
-          details: "It won't print",
-          client_id: 10,
-          site_id: 100,
-          user_id: 55,
-          emailfrom: "user@corp.com",
-          assets: [{ id: ASSET_NUM }],
-          category_1: "Hardware>Printer",
+          details_html: reportHtml({ email: "user@corp.com", host: "pc-01" }),
+          user_id: 999999999, // Tier2 always sends the unregistered catch-all user
+          client_id: 999, // ...and the catch-all client
+          site_id: 0,
         },
       ]),
     });
+    const haloId = ((await created.json()) as { id: number }).id;
 
+    const res = await req("/actions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "halo-app-name": "tier2tech" },
+      body: JSON.stringify([{ ticket_id: haloId, note_html: "<b>It won't print</b>" }]),
+    });
     expect(res.status).toBe(201);
-    const body = (await res.json()) as Record<string, unknown>;
-    expect(body).toMatchObject({ client_id: 10, site_id: 100, user_id: 55 });
-    expect(typeof body.id).toBe("number");
-    expect(body.gorelo_ticket_id).toBe("cb83b6cf-959c-4eed-afb8-ba3e18a3c53a");
 
+    const posted = cap.posted();
     expect(posted).toMatchObject({
       title: "Printer down",
+      // Resolved from the report email/hostname, NOT the catch-all ids Tier2 sent.
       clientId: 10,
       locationId: 100,
       contactId: 55,
       statusId: 1,
       groupId: 7,
       typeId: 3,
+      tagIds: [31974],
       agentAssetIds: [AGENT_UUID],
     });
     const desc = String(posted?.description);
-    expect(desc).toContain("It won't print");
-    expect(desc).toContain("category_1: Hardware>Printer");
+    expect(desc).toContain("It won't print"); // the /actions note
+    expect(desc).toContain("Reporter: user@corp.com"); // the resolution trail
+    // the pending row is consumed
+    const row = await env.DB.prepare(`SELECT command FROM pending_tickets WHERE halo_id = ?`)
+      .bind(haloId)
+      .first();
+    expect(row).toBeNull();
   });
 
-  it("falls back to the catch-all client when nothing matches", async () => {
-    let posted: Record<string, unknown> | undefined;
-    routes.push({
+  it("correlates the note by the ticket number in its text when no explicit id is sent", async () => {
+    const cap = captureGoreloCreate();
+    const created = await req("/tickets", {
       method: "POST",
-      match: (u) => u.pathname === "/v1/tickets",
-      handler: async (r) => {
-        posted = (await r.json()) as Record<string, unknown>;
-        return json(200, { ticketId: "00000000-0000-0000-0000-000000000000" });
-      },
+      headers: { "content-type": "application/json", "halo-app-name": "tier2tech" },
+      body: JSON.stringify([{ summary: "help", details_html: reportHtml({ email: "user@corp.com" }) }]),
     });
-    const res = await req("/api/Tickets", {
+    const haloId = ((await created.json()) as { id: number }).id;
+
+    // Tier2's notification email embeds the returned id as "ticket number <id>".
+    const res = await req("/actions", {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify([{ summary: "help", details: "x", emailfrom: "stranger@nowhere.test" }]),
+      headers: { "content-type": "application/json", "halo-app-name": "tier2tech" },
+      body: JSON.stringify([{ note_html: `<p>You have a new ticket number ${haloId} from your Helpdesk</p>` }]),
     });
     expect(res.status).toBe(201);
-    expect(posted).toMatchObject({ clientId: 999, contactId: null, agentAssetIds: [] });
+    expect(cap.posted()).toMatchObject({ contactId: 55, clientId: 10 });
+  });
+
+  it("resolves the contact from the report even when Tier2 sends only catch-all ids", async () => {
+    const cap = captureGoreloCreate();
+    const created = await req("/tickets", {
+      method: "POST",
+      headers: { "content-type": "application/json", "halo-app-name": "tier2tech" },
+      body: JSON.stringify([
+        {
+          user_id: 999999999,
+          client_id: 999,
+          site_id: 0,
+          summary: "Test",
+          details_html: reportHtml({ email: "user@corp.com", host: "PC-01", company: "Corp" }),
+        },
+      ]),
+    });
+    const haloId = ((await created.json()) as { id: number }).id;
+    await req("/actions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "halo-app-name": "tier2tech" },
+      body: JSON.stringify([{ ticket_id: haloId, note_html: "note" }]),
+    });
+    // Contact + client + asset all recovered from the report, not the catch-all input.
+    expect(cap.posted()).toMatchObject({ clientId: 10, contactId: 55, agentAssetIds: [AGENT_UUID] });
+  });
+
+  it("falls back to the catch-all client when the report resolves nothing", async () => {
+    const cap = captureGoreloCreate("00000000-0000-0000-0000-000000000000");
+    const created = await req("/tickets", {
+      method: "POST",
+      headers: { "content-type": "application/json", "halo-app-name": "tier2tech" },
+      body: JSON.stringify([{ summary: "help", details_html: reportHtml({ email: "stranger@nowhere.test" }) }]),
+    });
+    const haloId = ((await created.json()) as { id: number }).id;
+    await req("/actions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "halo-app-name": "tier2tech" },
+      body: JSON.stringify([{ ticket_id: haloId, note_html: "x" }]),
+    });
+    expect(cap.posted()).toMatchObject({ clientId: 999, contactId: null, agentAssetIds: [] });
+  });
+
+  it("orphan-flush creates a queued ticket whose note never arrived", async () => {
+    const cap = captureGoreloCreate("11111111-1111-1111-1111-111111111111");
+    // Insert a pending row that is already past the grace window.
+    const cmd = {
+      title: "Orphaned",
+      createdByName: "x",
+      clientId: 10,
+      locationId: null,
+      contactId: null,
+      description: "d",
+      statusId: 1,
+      groupId: 7,
+      typeId: 3,
+      priorityId: 2,
+      sourceId: 6,
+      agentAssetIds: [],
+      sendTicketCreatedEmail: false,
+    };
+    await env.DB.prepare(`INSERT INTO pending_tickets (halo_id, command, created_at) VALUES (?,?,?)`)
+      .bind(4242, JSON.stringify(cmd), "2000-01-01T00:00:00Z")
+      .run();
+
+    const n = await flushPendingTickets(env);
+    expect(n).toBe(1);
+    expect(cap.posted()).toMatchObject({ title: "Orphaned", clientId: 10 });
+    const row = await env.DB.prepare(`SELECT halo_id FROM pending_tickets WHERE halo_id = 4242`).first();
+    expect(row).toBeNull();
   });
 });

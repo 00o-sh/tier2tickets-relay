@@ -17,6 +17,7 @@ export default defineConfig({
           DEFAULT_PRIORITY: "2",
           DEFAULT_SOURCE: "6",
           CATCHALL_CLIENT_ID: "999",
+          HDB_TAG_ID: "31974",
           GORELO_API_KEY: "test-gorelo-key",
           EXPECTED_KEY: "test-expected-key",
           ADMIN_KEY: "test-admin-key",
