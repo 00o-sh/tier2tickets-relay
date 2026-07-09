@@ -20,6 +20,11 @@ export interface Env {
   GORELO_API_KEY: string; // X-API-Key sent to Gorelo
   EXPECTED_KEY: string; // the key Tier2 sends us (gates ticket creation)
   ADMIN_KEY: string; // gates POST /admin/sync
+
+  // optional Halo mock OAuth credentials (Tier2's client_id/client_secret).
+  // If both set, the token endpoint validates them; otherwise any creds are accepted.
+  HALO_CLIENT_ID?: string;
+  HALO_CLIENT_SECRET?: string;
 }
 
 /**
@@ -84,8 +89,17 @@ export interface PublicClientResponse {
 export interface PublicContactResponse {
   id: number;
   primaryEmail?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
   clientId?: number | null;
   clientLocationId?: number | null;
+}
+
+/** GET /v1/clients/{clientId}/locations item. */
+export interface PublicClientLocationResponse {
+  id: number;
+  name?: string | null;
+  clientId?: number | null;
 }
 
 /** Normalized identity extracted from a Helpdesk Buttons press. */

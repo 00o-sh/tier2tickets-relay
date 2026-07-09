@@ -1,13 +1,12 @@
 import { getLastSync, initSchema } from "./db.js";
 import { extractTicketNumber, GoreloClient, GoreloError } from "./gorelo.js";
+import { handleHalo, isHaloPath } from "./halo.js";
 import { matchClient } from "./matcher.js";
 import { buildIdentity, normalizeEmail, parseHdbTag, parseInbound, stripHdbTag } from "./parse.js";
 import { syncAll } from "./sync.js";
 import { buildDescription, buildTicketCommand } from "./ticket.js";
+import { ipAllowed } from "./tier2.js";
 import type { Env } from "./types.js";
-
-// Tier2Tickets cloud posts from these two fixed source IPs.
-const TIER2_SOURCE_IPS = new Set(["34.202.14.153", "3.209.57.193"]);
 
 const textResponse = (status: number, body: string): Response =>
   new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
@@ -46,8 +45,11 @@ export default {
     if (request.method === "POST" && url.pathname === "/admin/sync") {
       if (!adminKeyOk(request, env)) return textResponse(401, "unauthorized");
       try {
-        const result = await syncAll(env);
-        return textResponse(200, `ok devices=${result.devices} domains=${result.domains}`);
+        const r = await syncAll(env);
+        return textResponse(
+          200,
+          `ok clients=${r.clients} domains=${r.domains} locations=${r.locations} contacts=${r.contacts} devices=${r.devices}`,
+        );
       } catch (err) {
         console.error("admin sync failed", describeError(err));
         return textResponse(502, "sync failed");
@@ -57,6 +59,12 @@ export default {
     // Lightweight health check (no secrets).
     if (request.method === "GET" && url.pathname === "/health") {
       return textResponse(200, "ok");
+    }
+
+    // HaloPSA/ITSM mock (OAuth token + resource server). Routed by path so it
+    // coexists with the osTicket path on the same Worker. See src/halo.ts.
+    if (isHaloPath(url.pathname)) {
+      return handleHalo(request, env);
     }
 
     // Everything else that's a POST is treated as an osTicket-style ticket create.
@@ -72,7 +80,11 @@ export default {
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(
       syncAll(env)
-        .then((r) => console.log(`cron sync ok devices=${r.devices} domains=${r.domains}`))
+        .then((r) =>
+          console.log(
+            `cron sync ok clients=${r.clients} domains=${r.domains} locations=${r.locations} contacts=${r.contacts} devices=${r.devices}`,
+          ),
+        )
         .catch((err) => console.error("cron sync failed", describeError(err))),
     );
   },
@@ -80,12 +92,9 @@ export default {
 
 async function handleTicketCreate(request: Request, env: Env): Promise<Response> {
   // 1. IP allowlist (Tier2's two fixed source IPs).
-  if (env.ENFORCE_IP_ALLOWLIST === "true") {
-    const ip = request.headers.get("CF-Connecting-IP") ?? "";
-    if (!TIER2_SOURCE_IPS.has(ip)) {
-      console.warn("rejected ticket create: source IP not allowlisted");
-      return textResponse(403, "forbidden");
-    }
+  if (!ipAllowed(request, env)) {
+    console.warn("rejected ticket create: source IP not allowlisted");
+    return textResponse(403, "forbidden");
   }
 
   // 2. Shared-secret gate (the "API key" Tier2 sends).
