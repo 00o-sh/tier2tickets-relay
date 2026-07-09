@@ -9,10 +9,12 @@ compatibility_flags = ["nodejs_compat"]
 enabled = true
 invocation_logs = true
 
-# Refresh the D1 mirror of Gorelo agents/clients every 6 hours (off the request path).
-# Tune as needed; syncAll() is idempotent.
+# Two crons (differentiated in src/index.ts `scheduled` by `event.cron`):
+#   "0 */6 * * *"  refreshes the D1 mirror of Gorelo agents/clients (idempotent syncAll).
+#   "*/5 * * * *"  flushes orphaned deferred tickets — a press whose /actions note never
+#                  arrived — creating them note-less after the PENDING_GRACE_MS window.
 [triggers]
-crons = ["0 */6 * * *"]
+crons = ["0 */6 * * *", "*/5 * * * *"]
 
 [vars]
 # US: https://api.usw.gorelo.io   AU: https://api.aue.gorelo.io
@@ -51,6 +53,11 @@ DEFAULT_SOURCE = "6"
 # GET /v1/clients -> 15567 "Salient MSP" (isDefault:true) — unmatched presses land on the
 # MSP's own default client with a triage note for a tech to reassign.
 CATCHALL_CLIENT_ID = "15567"
+
+# Gorelo tag applied to every Helpdesk Buttons ticket (tagIds on the create command).
+# 31974 "Submitted VIA HDB" — lets you filter/report on HDB-originated tickets. This is
+# a TAG (not a ticket type; DEFAULT_TYPE_ID stays 7045 "Incident"). Unset to skip tagging.
+HDB_TAG_ID = "31974"
 
 # --- Secrets (set via CLI, never committed) ---
 #   wrangler secret put GORELO_API_KEY   # X-API-Key for Gorelo (ticket write + asset/contact/client read scopes)

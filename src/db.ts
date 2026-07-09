@@ -62,6 +62,19 @@ export async function initSchema(db: D1Database): Promise<void> {
         value TEXT
       )`,
     ),
+    // Deferred Gorelo ticket creates. Tier2's Halo flow POSTs the ticket, then
+    // POSTs the actual report as an /actions note — but Gorelo has no
+    // ticket-append endpoint, so we hold the built command here (keyed by the
+    // Halo ticket id we hand back) and create the Gorelo ticket only once the
+    // note arrives (or the cron orphan-flush fires).
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS pending_tickets (
+        halo_id    INTEGER PRIMARY KEY,
+        command    TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )`,
+    ),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_pending_created ON pending_tickets (created_at)`),
   ]);
 
   // Additive migration: a devices table created before Phase 2 lacks the new
@@ -263,6 +276,57 @@ export async function getAgentIdByAssetNum(db: D1Database, assetNum: number): Pr
     .bind(assetNum)
     .first<{ agent_id: string | null }>();
   return row ? row.agent_id : null;
+}
+
+// --- Deferred ticket queue (Halo /tickets -> /actions) ----------------------
+
+export interface PendingRow {
+  halo_id: number;
+  command: string;
+  created_at: string;
+}
+
+/** Store (or replace) a built Gorelo command awaiting its /actions note. */
+export async function putPendingTicket(
+  db: D1Database,
+  haloId: number,
+  command: string,
+  createdAt: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO pending_tickets (halo_id, command, created_at) VALUES (?,?,?)
+       ON CONFLICT(halo_id) DO UPDATE SET command = excluded.command, created_at = excluded.created_at`,
+    )
+    .bind(haloId, command, createdAt)
+    .run();
+}
+
+/** Atomically claim (delete + return) one pending ticket by its Halo id. */
+export async function takePendingTicket(db: D1Database, haloId: number): Promise<PendingRow | null> {
+  return db
+    .prepare(`DELETE FROM pending_tickets WHERE halo_id = ? RETURNING halo_id, command, created_at`)
+    .bind(haloId)
+    .first<PendingRow>();
+}
+
+/** Atomically claim all pending tickets older than the cutoff (orphan flush). */
+export async function takeStalePendingTickets(
+  db: D1Database,
+  cutoffIso: string,
+  limit = 50,
+): Promise<PendingRow[]> {
+  const { results } = await db
+    .prepare(
+      `DELETE FROM pending_tickets
+       WHERE halo_id IN (
+         SELECT halo_id FROM pending_tickets WHERE created_at < ? ORDER BY created_at LIMIT ?
+       )
+       RETURNING halo_id, command, created_at`,
+    )
+    .bind(cutoffIso, limit)
+    .all<PendingRow>();
+  return results ?? [];
 }
 
 // --- sync bookkeeping -------------------------------------------------------

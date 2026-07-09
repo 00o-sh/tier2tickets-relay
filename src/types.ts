@@ -15,6 +15,7 @@ export interface Env {
   DEFAULT_PRIORITY: string; // PublicTicketPriority int as string
   DEFAULT_SOURCE: string; // TicketSource int as string
   CATCHALL_CLIENT_ID: string; // int as string
+  HDB_TAG_ID?: string; // Gorelo tag id applied to every HDB ticket ("Submitted VIA HDB")
 
   // secrets (wrangler secret put ...)
   GORELO_API_KEY: string; // X-API-Key sent to Gorelo
@@ -54,6 +55,8 @@ export interface CreatePublicTicketCommand {
   typeId: number; // required (non-nullable)
   priorityId: PublicTicketPriority; // required (non-nullable)
   sourceId: TicketSource; // required (non-nullable)
+  // CONFIRMED (swagger): array of int64 tag ids. Optional; omitted when unset.
+  tagIds?: number[];
   // CONFIRMED (swagger): items are string UUIDs (PublicDeviceResponse.id is a uuid).
   agentAssetIds: string[];
   sendTicketCreatedEmail: boolean;

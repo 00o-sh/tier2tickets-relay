@@ -1,12 +1,16 @@
 import { getLastSync, initSchema } from "./db.js";
 import { extractTicketNumber, GoreloClient, GoreloError } from "./gorelo.js";
-import { handleHalo, isHaloRequest } from "./halo.js";
+import { flushPendingTickets, handleHalo, isHaloRequest } from "./halo.js";
 import { matchClient } from "./matcher.js";
 import { buildIdentity, normalizeEmail, parseHdbTag, parseInbound, stripHdbTag } from "./parse.js";
 import { syncAll } from "./sync.js";
 import { buildDescription, buildTicketCommand } from "./ticket.js";
 import { ipAllowed } from "./tier2.js";
 import type { Env } from "./types.js";
+
+// The 6-hourly mirror-refresh cron (must match wrangler.toml [triggers].crons).
+// Any other cron firing is treated as the frequent orphaned-ticket flush.
+const SYNC_CRON = "0 */6 * * *";
 
 const textResponse = (status: number, body: string): Response =>
   new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
@@ -38,7 +42,7 @@ export function toOsTicketNumber(id: string): string {
 }
 
 export default {
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // Admin: manual mirror refresh, gated by ADMIN_KEY.
@@ -65,7 +69,7 @@ export default {
     // `halo-app-name` header Tier2 sends (and a path fallback), so it coexists
     // with the osTicket path on the same Worker. See src/halo.ts.
     if (isHaloRequest(request, url.pathname)) {
-      return handleHalo(request, env);
+      return handleHalo(request, env, ctx);
     }
 
     // Everything else that's a POST is treated as an osTicket-style ticket create.
@@ -77,16 +81,28 @@ export default {
     return textResponse(404, "not found");
   },
 
-  // Cron Trigger: refresh the D1 mirror off the request path.
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  // Cron Triggers: the frequent cron flushes orphaned deferred tickets (a press
+  // whose /actions note never arrived); the 6-hourly cron refreshes the mirror.
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (event.cron === SYNC_CRON) {
+      ctx.waitUntil(
+        syncAll(env)
+          .then((r) =>
+            console.log(
+              `cron sync ok clients=${r.clients} domains=${r.domains} locations=${r.locations} contacts=${r.contacts} devices=${r.devices}`,
+            ),
+          )
+          .catch((err) => console.error("cron sync failed", describeError(err))),
+      );
+      return;
+    }
     ctx.waitUntil(
-      syncAll(env)
-        .then((r) =>
-          console.log(
-            `cron sync ok clients=${r.clients} domains=${r.domains} locations=${r.locations} contacts=${r.contacts} devices=${r.devices}`,
-          ),
-        )
-        .catch((err) => console.error("cron sync failed", describeError(err))),
+      initSchema(env.DB)
+        .then(() => flushPendingTickets(env))
+        .then((n) => {
+          if (n > 0) console.log(`cron flush created ${n} orphaned ticket(s)`);
+        })
+        .catch((err) => console.error("cron flush failed", describeError(err))),
     );
   },
 } satisfies ExportedHandler<Env>;
