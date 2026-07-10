@@ -16,6 +16,7 @@ import {
   type ContactRow,
   type DeviceFullRow,
 } from "./db.js";
+import { notify } from "@ambersecurityinc/notifly";
 import { GoreloClient, GoreloError, extractTicketNumber } from "./gorelo.js";
 import { normalizeEmail, normalizeHost } from "./parse.js";
 import { assetNum, syncAll } from "./sync.js";
@@ -873,7 +874,7 @@ function ticketNumberFromText(text: string): number | null {
  * ticket (explicit ticket id field, else the ticket number in the note text),
  * fold the note into the description, then create the Gorelo ticket.
  */
-async function handleActions(env: Env, body: string): Promise<Response> {
+async function handleActions(env: Env, ctx: ExecutionContext | undefined, body: string): Promise<Response> {
   const parsed = parseJson(body);
   const actions = (Array.isArray(parsed) ? parsed : [parsed]).filter(
     (a): a is Record<string, unknown> => a != null && typeof a === "object",
@@ -935,6 +936,9 @@ async function handleActions(env: Env, body: string): Promise<Response> {
     const attempts = pending.attempts + 1;
     if (attempts >= MAX_PENDING_ATTEMPTS) {
       console.error(`HALO dead-letter halo_id=${haloId} after ${attempts} attempts: ${String(err)}`);
+      const alert = postDeadLetter(env, { haloId, command: JSON.stringify(cmd), attempts, error: String(err) });
+      if (ctx) ctx.waitUntil(alert);
+      else await alert;
     } else {
       await putPendingTicket(env.DB, haloId, JSON.stringify(cmd), pending.created_at, attempts);
     }
@@ -944,6 +948,71 @@ async function handleActions(env: Env, body: string): Promise<Response> {
     }
     throw err;
   }
+}
+
+/** Parse the configured notifly (Apprise) URLs — comma / whitespace / newline separated. */
+export function notiflyUrls(env: Env): string[] {
+  return (env.NOTIFLY_URLS ?? "")
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * A dead-lettered ticket is a lost help request, so (optionally) alert via notifly —
+ * one Apprise URL per destination (ntfy / Teams / Slack / …). notify() never throws;
+ * we log any per-destination failures. The body carries enough to recreate the ticket.
+ */
+async function postDeadLetter(
+  env: Env,
+  info: { haloId: number; command: string; attempts: number; error: string },
+): Promise<void> {
+  const urls = notiflyUrls(env);
+  if (!urls.length) return;
+  let cmd: Partial<CreatePublicTicketCommand> = {};
+  try {
+    cmd = JSON.parse(info.command) as CreatePublicTicketCommand;
+  } catch {
+    /* keep empty */
+  }
+  const title = `⚠️ HDB ticket dropped after ${info.attempts} failed Gorelo creates`;
+  const body = [
+    `Title: ${cmd.title ?? "(none)"}`,
+    `Client: ${cmd.clientId ?? "?"}  Contact: ${cmd.contactId ?? "none"}  Location: ${cmd.locationId ?? "none"}`,
+    `Attempts: ${info.attempts}`,
+    `Error: ${info.error}`,
+    "",
+    "--- ticket (recreate manually) ---",
+    htmlToText(cmd.description ?? ""),
+  ].join("\n");
+  const results = await notify({ urls }, { title, body, type: "failure" });
+  const failed = results.filter((r) => !r.success);
+  if (failed.length) {
+    console.error(
+      `HALO dead-letter notify failures halo_id=${info.haloId}: ` +
+        failed.map((f) => `${f.service}:${f.error ?? "?"}`).join("; "),
+    );
+  }
+}
+
+/**
+ * Send a test alert through the real notifly path so the wiring can be verified on
+ * demand (POST /admin/test-webhook), returning the per-destination results.
+ */
+export async function testNotifly(
+  env: Env,
+): Promise<{ configured: boolean; results: Array<{ service: string; success: boolean; error?: string }> }> {
+  const urls = notiflyUrls(env);
+  if (!urls.length) return { configured: false, results: [] };
+  const results = await notify(
+    { urls },
+    {
+      title: "✅ Helpdesk Buttons → Gorelo relay",
+      body: "Dead-letter alert test. If you see this, notifly alerts are wired up.",
+      type: "info",
+    },
+  );
+  return { configured: true, results };
 }
 
 /**
@@ -967,6 +1036,12 @@ export async function flushPendingTickets(env: Env): Promise<number> {
       const attempts = row.attempts + 1;
       if (attempts >= MAX_PENDING_ATTEMPTS) {
         console.error(`HALO dead-letter halo_id=${row.halo_id} after ${attempts} attempts: ${String(err)}`);
+        await postDeadLetter(env, {
+          haloId: row.halo_id,
+          command: row.command,
+          attempts,
+          error: String(err),
+        });
       } else {
         await putPendingTicket(env.DB, row.halo_id, row.command, row.created_at, attempts);
         console.error(`HALO orphan-flush failed halo_id=${row.halo_id} (attempt ${attempts}): ${String(err)}`);
@@ -994,7 +1069,7 @@ async function handleApi(
   }
   if (resource === "action" || resource === "actions") {
     // The note folds into the queued ticket, which is then created in Gorelo.
-    if (method === "POST") return handleActions(env, body);
+    if (method === "POST") return handleActions(env, ctx, body);
     return jsonResponse(200, []);
   }
   if (method === "GET") {

@@ -1,6 +1,6 @@
 import { initSchema } from "./db.js";
 import { GoreloError } from "./gorelo.js";
-import { flushPendingTickets, handleHalo, isHaloRequest } from "./halo.js";
+import { flushPendingTickets, handleHalo, isHaloRequest, testNotifly } from "./halo.js";
 import { syncAll } from "./sync.js";
 import type { Env } from "./types.js";
 
@@ -28,6 +28,22 @@ export default {
         console.error("admin sync failed", describeError(err));
         return textResponse(502, "sync failed");
       }
+    }
+
+    // Admin: fire a test alert through the notifly dead-letter path (ADMIN_KEY).
+    if (request.method === "POST" && url.pathname === "/admin/test-webhook") {
+      if (!adminKeyOk(request, env)) return textResponse(401, "unauthorized");
+      const r = await testNotifly(env);
+      if (!r.configured) return textResponse(400, "NOTIFLY_URLS not set");
+      const ok = r.results.filter((x) => x.success);
+      const failed = r.results.filter((x) => !x.success);
+      const detail = failed.length
+        ? ` — ${failed.map((f) => `${f.service}: ${f.error ?? "?"}`).join("; ")}`
+        : "";
+      return textResponse(
+        failed.length ? 502 : 200,
+        `notifly: ${ok.length} ok, ${failed.length} failed${detail}`,
+      );
     }
 
     // Lightweight health check (no secrets).

@@ -22,6 +22,9 @@ export interface Env {
   // secrets (wrangler secret put ...)
   GORELO_API_KEY: string; // X-API-Key sent to Gorelo
   ADMIN_KEY: string; // gates POST /admin/sync
+  // Optional notifly (Apprise-style) URLs alerted when a ticket is dead-lettered.
+  // Comma/space/newline separated, e.g. "ntfy://alerts, msteams://…, slack://…".
+  NOTIFLY_URLS?: string;
 
   // optional Halo mock OAuth credentials (Tier2's client_id/client_secret).
   // If both set, the token endpoint validates them; otherwise any creds are accepted.

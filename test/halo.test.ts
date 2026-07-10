@@ -456,15 +456,25 @@ describe("Halo deferred ticket create (/tickets queues, /actions creates)", () =
     expect(cap.posted()).toMatchObject({ priorityId: 2 }); // DEFAULT_PRIORITY
   });
 
-  it("dead-letters a queued ticket after MAX_PENDING_ATTEMPTS failed creates", async () => {
+  it("dead-letters a queued ticket after MAX_PENDING_ATTEMPTS + alerts via notifly", async () => {
     // Gorelo create keeps failing.
     routes.push({
       method: "POST",
       match: (u) => u.pathname === "/v1/tickets",
       handler: () => json(500, { error: "boom" }),
     });
+    // Capture the notifly delivery (jsons:// -> POST https://hooks.example.com/dead-letter).
+    let alert: Record<string, unknown> | undefined;
+    routes.push({
+      method: "POST",
+      match: (u) => u.host === "hooks.example.com",
+      handler: async (r) => {
+        alert = (await r.json()) as Record<string, unknown>;
+        return new Response("ok", { status: 200 });
+      },
+    });
     // A stale pending row already at attempt 4 -> the next failure is attempt 5 = give up.
-    const cmd = { title: "Doomed", clientId: 10, statusId: 1, groupId: 7, typeId: 3, priorityId: 2, sourceId: 6, agentAssetIds: [] };
+    const cmd = { title: "Doomed", clientId: 10, contactId: 55, statusId: 1, groupId: 7, typeId: 3, priorityId: 2, sourceId: 6, agentAssetIds: [] };
     await env.DB.prepare(`INSERT INTO pending_tickets (halo_id, command, created_at, attempts) VALUES (?,?,?,?)`)
       .bind(9999, JSON.stringify(cmd), "2000-01-01T00:00:00Z", 4)
       .run();
@@ -474,6 +484,31 @@ describe("Halo deferred ticket create (/tickets queues, /actions creates)", () =
     // Dropped, not re-queued.
     const row = await env.DB.prepare(`SELECT halo_id FROM pending_tickets WHERE halo_id = 9999`).first();
     expect(row).toBeNull();
+    // notifly alerted (webhook payload = {title, body, ...}); body carries recreate detail.
+    expect(String(alert?.title)).toContain("dropped after 5");
+    expect(String(alert?.body)).toContain("Doomed");
+    expect(String(alert?.body)).toContain("Client: 10");
+  });
+
+  it("POST /admin/test-webhook fires a test alert via notifly and reports results", async () => {
+    let alert: Record<string, unknown> | undefined;
+    routes.push({
+      method: "POST",
+      match: (u) => u.host === "hooks.example.com",
+      handler: async (r) => {
+        alert = (await r.json()) as Record<string, unknown>;
+        return new Response("ok", { status: 200 });
+      },
+    });
+    const res = await req("/admin/test-webhook", { method: "POST", headers: { "X-Admin-Key": "test-admin-key" } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("notifly: 1 ok, 0 failed");
+    expect(String(alert?.title)).toContain("Helpdesk Buttons");
+  });
+
+  it("POST /admin/test-webhook requires the admin key", async () => {
+    const res = await req("/admin/test-webhook", { method: "POST" });
+    expect(res.status).toBe(401);
   });
 
   it("re-queues with an incremented attempt when a create fails below the cap", async () => {
