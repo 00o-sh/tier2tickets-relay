@@ -19,6 +19,6 @@
     "wrangler": "4.107.1"
   },
   "dependencies": {
-    "@ambersecurityinc/notifly": "0.6.0"
+    "@ambersecurityinc/notifly": "0.7.0"
   }
 }
