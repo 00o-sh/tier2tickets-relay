@@ -156,6 +156,12 @@ Report** link (screenshots/diagnostics). The routing outcome is logged, not show
 **Priority:** a press flagged "This is an emergency" is created at `EMERGENCY_PRIORITY`
 (else `DEFAULT_PRIORITY`).
 
+**Requester email:** Gorelo's "ticket created" email is suppressed by default
+(`sendTicketCreatedEmail=false`). Set `SEND_TICKET_CREATED_EMAIL=true` to enable it —
+but the Worker still only asks for it when it **resolved a real client contact**
+(`contactId`). A press that falls back to the catch-all client (no contact match)
+never sends the email, so it can't notify the wrong party.
+
 **ID mapping:** Halo `client_id`/`site_id`/`user_id` *are* the Gorelo client / location
 / contact ids (the lookups return them). Assets use a deterministic numeric surrogate
 of the agent UUID (`asset_num`, stored in D1), mapped back on create.
