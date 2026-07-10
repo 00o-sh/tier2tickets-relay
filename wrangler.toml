@@ -16,6 +16,24 @@ invocation_logs = true
 [triggers]
 crons = ["0 */6 * * *", "*/5 * * * *"]
 
+# Location fetches have no bulk Gorelo endpoint, so they're one call per client.
+# Doing all of them inline blows the Worker's 50 external-subrequest/invocation
+# cap (free plan) at scale, so syncAll enqueues one message per client here and a
+# queue consumer fetches locations in small batches — each consumer invocation
+# gets its own subrequest budget. Queues are on the free plan (10k ops/day).
+[[queues.producers]]
+binding = "SYNC_QUEUE"
+queue = "tier2tickets-sync"
+
+[[queues.consumers]]
+queue = "tier2tickets-sync"
+# <=10 clients per batch -> <=10 location fetches per invocation, well under 50.
+max_batch_size = 10
+max_batch_timeout = 10
+# Per-message retry with backoff replaces the hand-rolled fetch retry loop for
+# locations; give a rate-limited client a few tries before giving up this cycle.
+max_retries = 3
+
 [vars]
 # US: https://api.usw.gorelo.io   AU: https://api.aue.gorelo.io
 GORELO_BASE_URL = "https://api.usw.gorelo.io"

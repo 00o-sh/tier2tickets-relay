@@ -65,6 +65,11 @@ wrangler d1 create tier2tickets-relay
 wrangler d1 migrations apply tier2tickets-relay          # remote
 wrangler d1 migrations apply tier2tickets-relay --local  # for `wrangler dev`
 
+# 2b. Create the location-sync queue (one-time; syncAll fans location fetches
+#     out to it, a queue consumer reconciles them per client). Deploy fails
+#     without it since wrangler.toml binds it as a producer + consumer.
+wrangler queues create tier2tickets-sync
+
 # 3. Fill the Gorelo IDs in wrangler.toml [vars]
 GORELO_API_KEY=xxxx ./scripts/gorelo-ids.sh
 #   -> set DEFAULT_GROUP_ID, DEFAULT_TYPE_ID, DEFAULT_STATUS_ID, DEFAULT_PRIORITY,
@@ -214,35 +219,41 @@ Gorelo's agent/client lists have no server-side filters, so they're mirrored int
 - **Manual** `POST /admin/sync` (gated by `ADMIN_KEY`) for post-onboarding refresh.
 - **Lazy bootstrap** — on the first Halo call ever (no `last_sync` row), `syncAll()`
   runs once inline so a fresh deploy self-heals.
-- `syncAll()` mirrors clients, **all contacts (one bulk `GET /v1/contacts`)**,
-  locations (per-client — no bulk endpoint) and the agent fleet (rich device rows
-  with `asset_num`), with retry/backoff on Gorelo `429`/`5xx` — **honoring
-  `Retry-After`** and running per-client fetches at low concurrency. It
-  **delta-reconciles** each table
-  rather than rewriting it: every fetched row is upserted with an `ON CONFLICT …
-  DO UPDATE … WHERE <columns differ>` guard (so unchanged rows write nothing),
-  then only rows that vanished upstream are deleted. D1 writes per sync scale with
-  actual churn, not fleet size — a no-change sync costs ~0 writes, which keeps the
-  6-hourly refresh cheap even for large tenants. (Devices upsert on a unique
+- `syncAll()` mirrors clients, **all contacts (one bulk `GET /v1/contacts`)** and
+  the agent fleet (rich device rows with `asset_num`) inline, then **fans location
+  fetches out to a queue** (see below). It **delta-reconciles** each table rather
+  than rewriting it: every fetched row is upserted with an `ON CONFLICT … DO UPDATE
+  … WHERE <columns differ>` guard (so unchanged rows write nothing), then only rows
+  that vanished upstream are deleted. D1 writes per sync scale with actual churn,
+  not fleet size — a no-change sync costs ~0 writes. (Devices upsert on a unique
   `agent_id` index; the other tables on their integer primary key.)
-- **Subrequest budget** — a Worker invocation has a hard subrequest cap (50 on
-  the free plan, 1000 on paid), and every Gorelo `fetch` + D1 query counts. The
-  sync is kept lean to fit it on the free plan: contacts in one bulk call rather
-  than one per client; the idempotent schema migrations are gated behind a
-  `schema_version` row in `sync_meta` so they run once, not every sync (steady
-  state is a single version-check read); and D1 writes go out in larger batches.
-  Locations still cost one call per client (no bulk endpoint), so that's the
-  factor that grows the budget as clients are added.
-- **Partial-fetch safety** — if the bulk contacts or a per-client locations fetch
-  fails, the fetched set is incomplete, so that table is **upsert-only that run
-  (no deletes)** — rows we merely failed to fetch are never dropped; a later
-  complete sync reconciles them. Rows are also deduped by key with a deterministic
-  winner so a duplicate id in the feed doesn't flip-flop the row each run.
-- **Observability** — `syncAll()` returns `changed` (rows actually written this
-  run), `deleted` (rows removed as stale) and `complete` (all fetches succeeded)
-  alongside the mirrored totals. All are logged by the cron; the `POST /admin/sync`
-  response echoes the counts and appends `(partial: …)` when a fetch failed. A
-  steady state reads `changed=0 deleted=0 complete=true`.
+- **Subrequest budget & the location queue** — a Worker invocation has a hard cap
+  of **50 external `fetch` subrequests** (free plan; D1 and other Cloudflare
+  bindings are on a separate 1,000 budget and don't count). Agents/clients/contacts
+  are three bulk calls, but **locations have no bulk endpoint** — one `fetch` per
+  client — so an inline all-clients sweep (× retries) blew the 50 cap at scale.
+  Instead `syncAll()` enqueues one `SYNC_QUEUE` message per client and a **queue
+  consumer** (`queue()` in `src/index.ts`) fetches locations in batches of ≤10, so
+  each consumer invocation makes ≤10 Gorelo calls — well under 50 — and per-message
+  retry with backoff replaces the hand-rolled retry loop. Queues are on the free
+  plan. The idempotent schema migrations are also gated behind a `schema_version`
+  row in `sync_meta` (steady-state `initSchema` is a single version-check read).
+- **Location reconcile is per-client** — each queue message refreshes and
+  reconciles exactly one client's sites (`reconcileClientLocations`): upsert its
+  locations, delete only that client's stale rows. No global snapshot needed, so
+  fanning out across invocations is safe. `syncAll()` also drops locations of any
+  client that vanished upstream (inline, D1-only).
+- **Partial-fetch safety** — if the bulk contacts fetch fails, contacts are
+  **upsert-only that run (no deletes)** so rows we failed to fetch aren't dropped;
+  a later complete sync reconciles them. A failed location message **retries**
+  (never deletes) and is dropped after `max_retries`, to be re-enqueued next sync.
+  Rows are deduped by key with a deterministic winner so a duplicate id in a feed
+  doesn't flip-flop the row each run.
+- **Observability** — `syncAll()` returns `changed`/`deleted` (inline tables),
+  `locationsQueued`, and `complete` (bulk fetches succeeded). All are logged by the
+  cron; the `POST /admin/sync` response echoes the counts plus `locations_queued=N`
+  and appends `(partial: …)` when the contacts fetch failed. The queue consumer
+  logs per-client `changed`/`deleted`.
 - **Failure alerts** — if a sync throws (cron, `POST /admin/sync`, or the lazy
   bootstrap), it fires the configured notifly webhook(s) (`NOTIFLY_URLS`, the same
   path as dead-letter alerts) so a stale mirror doesn't degrade silently. No-op
