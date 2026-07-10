@@ -1,36 +1,21 @@
 import { initSchema, setLastSync } from "./db.js";
 import { GoreloClient } from "./gorelo.js";
 import { normalizeHost } from "./parse.js";
-import type { Env, PublicContactResponse, PublicDeviceResponse } from "./types.js";
+import type {
+  Env,
+  PublicClientLocationResponse,
+  PublicContactResponse,
+  PublicDeviceResponse,
+} from "./types.js";
 
 // D1 caps a batch's total bound parameters (~variable limit); the widest row
 // (devices, 10 cols) at 200/batch stays well under it. Larger chunks mean fewer
 // batches = fewer subrequests per sync — the fleet writes fit the invocation cap.
 const INSERT_CHUNK = 200;
-// Per-client Gorelo calls in flight at once. Kept low: at 5, the fleet's
-// per-client location/contact fetches tripped Gorelo's rate limit hard enough
-// that some fetches failed every sync (partial runs that never reconcile). The
-// client also honors Retry-After now, so a gentle-but-reliable sweep beats a
-// fast one that gets throttled.
-const FETCH_CONCURRENCY = 2;
 
 function chunk<T>(arr: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
-
-/** Run `fn` over items with bounded concurrency (keeps us under Gorelo rate limits). */
-async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const out: R[] = new Array(items.length);
-  let i = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (i < items.length) {
-      const idx = i++;
-      out[idx] = await fn(items[idx]!);
-    }
-  });
-  await Promise.all(workers);
   return out;
 }
 
@@ -56,11 +41,6 @@ interface DeviceInsert {
   localIp: string;
   publicIp: string;
   os: string;
-}
-interface LocationInsert {
-  id: number;
-  name: string;
-  clientId: number;
 }
 interface ContactInsert {
   id: number;
@@ -103,18 +83,20 @@ export interface TableStats {
 
 export interface SyncStats {
   clients: number;
-  locations: number;
+  locations: number; // current mirror size (this run's location refresh lands async via the queue)
   contacts: number;
   devices: number;
-  /** Rows actually written this run (inserts + updates); 0 on a no-change sync. */
+  /** Per-client location-fetch messages enqueued this run (processed async). */
+  locationsQueued: number;
+  /** Rows actually written this run for the inline tables (clients/contacts/devices). */
   changed: number;
-  /** Rows deleted this run because they disappeared from Gorelo. */
+  /** Rows deleted this run from the inline tables. */
   deleted: number;
   /**
-   * True when every Gorelo fetch succeeded. When false, a per-client
-   * locations/contacts fetch failed, so those tables were upsert-only (deletes
-   * skipped) to avoid dropping rows we merely failed to fetch — totals may
-   * include not-yet-reconciled rows until a fully-successful sync.
+   * True when the bulk fetches succeeded. When false, the bulk contacts fetch
+   * failed, so contacts were upsert-only (deletes skipped) to avoid dropping rows
+   * we merely failed to fetch. Locations are reconciled asynchronously by the
+   * queue consumer, so their success isn't reflected here.
    */
   complete: boolean;
 }
@@ -128,15 +110,15 @@ export async function syncAll(env: Env): Promise<SyncStats> {
   await initSchema(env.DB);
   const client = new GoreloClient(env);
 
-  // Contacts come from ONE bulk call (each row carries its own clientId), not one
-  // per client — that alone removes N-1 subrequests, the main reason a large-fleet
-  // sync blew past the Worker's per-invocation subrequest cap. Locations have no
-  // bulk endpoint, so they stay per-client (bounded concurrency).
+  // Agents, clients and ALL contacts come from three bulk calls (contacts carry
+  // their own clientId) — cheap on the 50 external-subrequest/invocation cap.
+  // Locations have NO bulk endpoint (one call per client), so doing them inline
+  // blew that cap at scale; instead we fan them out to a queue below and a
+  // consumer fetches them in small batches, each with its own subrequest budget.
   //
-  // Any fetch here can fail; if one does, the fetched set is INCOMPLETE and must
-  // NOT be treated as authoritative — otherwise the reconcile step would delete
-  // rows we merely failed to fetch, then re-insert them next run (write thrash +
-  // a window of missing lookups). Track completeness and gate deletes on it below.
+  // A bulk fetch can fail; if contacts do, the set is INCOMPLETE and must NOT be
+  // treated as authoritative — deleting then would drop rows we merely failed to
+  // fetch. Gate the contact deletes on that.
   const [agents, clients, allContacts] = await Promise.all([
     client.listAgents(),
     client.listClients(),
@@ -161,21 +143,6 @@ export async function syncAll(env: Env): Promise<SyncStats> {
     });
   }
 
-  const locationRows: LocationInsert[] = [];
-  let locationsComplete = true;
-  await mapLimit(clientIds, FETCH_CONCURRENCY, async (cid) => {
-    const locations = await client.listLocations(cid).catch((err) => {
-      locationsComplete = false;
-      console.error(`sync: listLocations(${cid}) failed — skipping location deletes: ${String(err)}`);
-      return null;
-    });
-    if (locations) {
-      for (const l of locations) {
-        locationRows.push({ id: l.id, name: (l.name ?? "").trim(), clientId: cid });
-      }
-    }
-  });
-
   const deviceRows = toDeviceRows(agents);
   const clientRows = clients.map((c) => ({ id: c.id, name: (c.name ?? "").trim() }));
 
@@ -191,18 +158,8 @@ export async function syncAll(env: Env): Promise<SyncStats> {
       )
       .bind(r.id, r.name),
   );
-  // locations/contacts pass their completeness flag: when a per-client fetch
-  // failed, the row set is partial, so upsert-only (no deletes) this run.
-  const locationStats = await syncTable(env.DB, "locations", "id", locationRows, (r) => r.id, (r) =>
-    env.DB
-      .prepare(
-        `INSERT INTO locations (id, name, client_id) VALUES (?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET name = excluded.name, client_id = excluded.client_id
-         WHERE locations.name IS NOT excluded.name OR locations.client_id IS NOT excluded.client_id`,
-      )
-      .bind(r.id, r.name, r.clientId),
-    locationsComplete,
-  );
+  // contacts pass their completeness flag: when the bulk fetch failed, the row
+  // set is partial, so upsert-only (no deletes) this run.
   const contactStats = await syncTable(env.DB, "contacts", "id", contactRows, (r) => r.id, (r) =>
     env.DB
       .prepare(
@@ -246,17 +203,87 @@ export async function syncAll(env: Env): Promise<SyncStats> {
       ),
   );
 
+  // Drop locations belonging to clients that no longer exist — the queue only
+  // reconciles clients we enqueue below, so a vanished client's sites would
+  // otherwise linger. D1-only, so it doesn't touch the external-subrequest cap.
+  if (clientIds.length) {
+    const ph = clientIds.map(() => "?").join(", ");
+    await env.DB.prepare(`DELETE FROM locations WHERE client_id NOT IN (${ph})`).bind(...clientIds).run();
+  }
+
+  // Fan out per-client location fetches to the queue: one message each, sent in
+  // batches of 100 (the sendBatch max). The consumer refreshes + reconciles each
+  // client's sites in small batches, keeping every invocation under the cap.
+  const messages = clientIds.map((cid) => ({ body: { type: "locations" as const, clientId: cid } }));
+  for (const part of chunk(messages, 100)) {
+    if (part.length) await env.SYNC_QUEUE.sendBatch(part);
+  }
+
   await setLastSync(env.DB, new Date().toISOString());
-  const all = [clientStats, locationStats, contactStats, deviceStats];
+  const locations = await countRows(env.DB, "locations");
   return {
     clients: clientStats.total,
-    locations: locationStats.total,
+    locations, // current mirror size; this run's refresh lands async via the queue
     contacts: contactStats.total,
     devices: deviceStats.total,
-    changed: all.reduce((n, s) => n + s.changed, 0),
-    deleted: all.reduce((n, s) => n + s.deleted, 0),
-    complete: locationsComplete && contactsComplete,
+    locationsQueued: messages.length,
+    changed: clientStats.changed + contactStats.changed + deviceStats.changed,
+    deleted: clientStats.deleted + contactStats.deleted + deviceStats.deleted,
+    complete: contactsComplete, // agents/clients throw on failure; locations reconcile async
   };
+}
+
+/** Count rows in a table (used for reporting the mirror size). */
+async function countRows(db: D1Database, table: string): Promise<number> {
+  const row = await db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+/**
+ * Refresh + reconcile ONE client's locations: upsert its sites, then delete only
+ * that client's stale rows. Scoped per-client so the queue consumer can process
+ * each client independently — no global snapshot needed for safe deletes.
+ */
+export async function reconcileClientLocations(
+  db: D1Database,
+  clientId: number,
+  locations: PublicClientLocationResponse[],
+): Promise<{ changed: number; deleted: number }> {
+  const rows = dedupeByKey(
+    locations.map((l) => ({ id: l.id, name: (l.name ?? "").trim(), clientId })),
+    (r) => r.id,
+  );
+  let changed = 0;
+  for (const part of chunk(rows, INSERT_CHUNK)) {
+    if (!part.length) continue;
+    const res = await db.batch(
+      part.map((r) =>
+        db
+          .prepare(
+            `INSERT INTO locations (id, name, client_id) VALUES (?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, client_id = excluded.client_id
+             WHERE locations.name IS NOT excluded.name OR locations.client_id IS NOT excluded.client_id`,
+          )
+          .bind(r.id, r.name, r.clientId),
+      ),
+    );
+    for (const x of res) changed += x.meta?.changes ?? 0;
+  }
+  // Reconcile deletes scoped to THIS client only.
+  const fetched = new Set(rows.map((r) => String(r.id)));
+  const { results } = await db
+    .prepare(`SELECT id FROM locations WHERE client_id = ?`)
+    .bind(clientId)
+    .all<{ id: number }>();
+  const stale = (results ?? [])
+    .map((r) => r.id)
+    .filter((id): id is number => id != null && !fetched.has(String(id)));
+  for (const part of chunk(stale, INSERT_CHUNK)) {
+    if (!part.length) continue;
+    const ph = part.map(() => "?").join(", ");
+    await db.batch([db.prepare(`DELETE FROM locations WHERE id IN (${ph})`).bind(...part)]);
+  }
+  return { changed, deleted: stale.length };
 }
 
 /**

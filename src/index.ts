@@ -1,8 +1,8 @@
 import { initSchema } from "./db.js";
-import { GoreloError } from "./gorelo.js";
+import { GoreloClient, GoreloError } from "./gorelo.js";
 import { flushPendingTickets, handleHalo, isHaloRequest, postSyncFailure, testNotifly } from "./halo.js";
-import { syncAll } from "./sync.js";
-import type { Env } from "./types.js";
+import { reconcileClientLocations, syncAll } from "./sync.js";
+import type { Env, SyncLocationsMessage } from "./types.js";
 
 // The 6-hourly mirror-refresh cron (must match wrangler.toml [triggers].crons).
 // Any other cron firing is treated as the frequent orphaned-ticket flush.
@@ -23,7 +23,8 @@ export default {
         return textResponse(
           200,
           `ok clients=${r.clients} locations=${r.locations} contacts=${r.contacts} devices=${r.devices} ` +
-            `changed=${r.changed} deleted=${r.deleted}${r.complete ? "" : " (partial: some fetches failed, deletes skipped)"}`,
+            `changed=${r.changed} deleted=${r.deleted} locations_queued=${r.locationsQueued}` +
+            `${r.complete ? "" : " (partial: bulk contacts fetch failed, contact deletes skipped)"}`,
         );
       } catch (err) {
         console.error("admin sync failed", describeError(err));
@@ -73,7 +74,8 @@ export default {
           .then((r) =>
             console.log(
               `cron sync ok clients=${r.clients} locations=${r.locations} contacts=${r.contacts} ` +
-                `devices=${r.devices} changed=${r.changed} deleted=${r.deleted} complete=${r.complete}`,
+                `devices=${r.devices} changed=${r.changed} deleted=${r.deleted} ` +
+                `locations_queued=${r.locationsQueued} complete=${r.complete}`,
             ),
           )
           .catch(async (err) => {
@@ -93,7 +95,32 @@ export default {
         .catch((err) => console.error("cron flush failed", describeError(err))),
     );
   },
-} satisfies ExportedHandler<Env>;
+
+  // Queue consumer: per-client location fetches fanned out by syncAll. Each batch
+  // is <=max_batch_size clients (wrangler.toml), so an invocation makes at most
+  // that many Gorelo calls — comfortably under the 50 external-subrequest cap that
+  // an inline all-clients sweep would exceed. Failed messages retry with backoff.
+  async queue(batch: MessageBatch<SyncLocationsMessage>, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await initSchema(env.DB);
+    const client = new GoreloClient(env);
+    for (const msg of batch.messages) {
+      const { clientId } = msg.body;
+      try {
+        const locations = await client.listLocations(clientId);
+        const { changed, deleted } = await reconcileClientLocations(env.DB, clientId, locations);
+        if (changed || deleted) {
+          console.log(`queue locations client=${clientId} changed=${changed} deleted=${deleted}`);
+        }
+        msg.ack();
+      } catch (err) {
+        // Transient (Gorelo rate-limit / 5xx) — let the queue redeliver with
+        // backoff up to max_retries, then drop. Never delete on failure.
+        console.error(`queue locations client=${clientId} failed, will retry: ${describeError(err)}`);
+        msg.retry();
+      }
+    }
+  },
+} satisfies ExportedHandler<Env, SyncLocationsMessage>;
 
 /**
  * Gate POST /admin/sync. Accepts the key via `X-API-Key` or `X-Admin-Key`

@@ -2,9 +2,17 @@
 // Ground truth: https://api.usw.gorelo.io/swagger/v1/swagger.json
 // (Verify against the live spec before deploy — see the runtime-verify checklist in README.)
 
-/** Worker environment: wrangler.toml [vars] + D1 binding + CLI secrets. */
+/** A queued unit of location-sync work: refresh + reconcile one client's sites. */
+export interface SyncLocationsMessage {
+  type: "locations";
+  clientId: number;
+}
+
+/** Worker environment: wrangler.toml [vars] + D1 binding + queue + CLI secrets. */
 export interface Env {
   DB: D1Database;
+  // Producer binding for the per-client location-fetch fan-out (see wrangler.toml).
+  SYNC_QUEUE: Queue<SyncLocationsMessage>;
 
   // vars
   GORELO_BASE_URL: string;

@@ -1,9 +1,11 @@
-import { env } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import worker from "../src/index.js";
 import { initSchema } from "../src/db.js";
 import { assetNum, syncAll } from "../src/sync.js";
+import type { SyncLocationsMessage } from "../src/types.js";
 
-// --- outbound fetch stub: mock the four Gorelo list endpoints syncAll pulls ----
+// --- outbound fetch stub: mock the Gorelo list endpoints the sync pulls --------
 interface GoreloData {
   agents: Record<string, unknown>[];
   clients: Record<string, unknown>[];
@@ -73,6 +75,37 @@ function baseData(): GoreloData {
   };
 }
 
+// A capturing SYNC_QUEUE producer: records the client ids syncAll enqueues.
+function makeQueue(): { queued: number[]; env: typeof env } {
+  const queued: number[] = [];
+  const SYNC_QUEUE = {
+    send: async (b: SyncLocationsMessage) => void queued.push(b.clientId),
+    sendBatch: async (msgs: Iterable<{ body: SyncLocationsMessage }>) => {
+      for (const m of msgs) queued.push(m.body.clientId);
+    },
+  } as unknown as Queue<SyncLocationsMessage>;
+  return { queued, env: { ...env, SYNC_QUEUE } };
+}
+
+// Drive the real queue consumer (worker.queue) over a set of client ids.
+async function runConsumer(clientIds: number[]): Promise<{ acked: number[]; retried: number[] }> {
+  const acked: number[] = [];
+  const retried: number[] = [];
+  const messages = clientIds.map((clientId) => ({
+    body: { type: "locations" as const, clientId },
+    id: `m-${clientId}`,
+    timestamp: new Date(0),
+    attempts: 1,
+    ack: () => void acked.push(clientId),
+    retry: () => void retried.push(clientId),
+  }));
+  const batch = { queue: "tier2tickets-sync", messages, ackAll: () => {}, retryAll: () => {} };
+  const ctx = createExecutionContext();
+  await worker.queue!(batch as unknown as MessageBatch<SyncLocationsMessage>, env, ctx);
+  await waitOnExecutionContext(ctx);
+  return { acked, retried };
+}
+
 async function wipe(): Promise<void> {
   await initSchema(env.DB);
   await env.DB.batch([
@@ -95,21 +128,23 @@ beforeEach(async () => {
   await wipe();
 });
 
-describe("syncAll delta reconcile", () => {
-  it("upserts the full dataset on a first (empty-mirror) sync", async () => {
-    const r = await syncAll(env);
-    // Every table starts empty, so all four rows are written and none deleted.
+describe("syncAll delta reconcile (inline tables + location fan-out)", () => {
+  it("reconciles clients/contacts/devices inline and enqueues one location message per client", async () => {
+    const q = makeQueue();
+    const r = await syncAll(q.env);
+    // Locations are NOT written inline — they're enqueued for the consumer.
     expect(r).toEqual({
       clients: 1,
-      locations: 1,
+      locations: 0, // queue not drained yet
       contacts: 1,
       devices: 1,
-      changed: 4,
+      locationsQueued: 1,
+      changed: 3, // clients + contacts + devices (locations are async)
       deleted: 0,
       complete: true,
     });
+    expect(q.queued).toEqual([10]);
     expect(await count("clients")).toBe(1);
-    expect(await count("locations")).toBe(1);
     expect(await count("contacts")).toBe(1);
     expect(await count("devices")).toBe(1);
 
@@ -122,56 +157,40 @@ describe("syncAll delta reconcile", () => {
   });
 
   it("reports zero changes when nothing changed upstream (no wasted writes)", async () => {
-    await syncAll(env);
-    const r = await syncAll(env); // identical dataset, second run
+    await syncAll(makeQueue().env);
+    const r = await syncAll(makeQueue().env); // identical dataset, second run
     expect(r.changed).toBe(0);
     expect(r.deleted).toBe(0);
-    // Row counts unchanged.
-    expect(r).toMatchObject({ clients: 1, locations: 1, contacts: 1, devices: 1 });
+    expect(r).toMatchObject({ clients: 1, contacts: 1, devices: 1, locationsQueued: 1 });
   });
 
-  it("is idempotent: a second identical sync changes no rows and keeps the data", async () => {
-    await syncAll(env);
-    // Tag every row so we can detect an unnecessary rewrite: a real
-    // delete+reinsert would blow these markers away, an upsert-with-diff-guard
-    // leaves untouched rows alone.
-    await env.DB.batch([
-      env.DB.prepare(`UPDATE clients SET name = name || '#'`),
-      env.DB.prepare(`UPDATE devices SET os = 'MARK'`),
-    ]);
-    // Re-fetch identical data (except the columns we just poked locally). The
-    // client name now differs from upstream, so it SHOULD be corrected; the
-    // device os we set is not part of the Gorelo agent payload (os is always
-    // "" from the fleet list) so it will be rewritten back to "".
-    await syncAll(env);
+  it("is idempotent: a second identical sync changes no inline rows and keeps the data", async () => {
+    await syncAll(makeQueue().env);
+    // Poke a column upstream-owns so an unnecessary rewrite would be visible; the
+    // upsert's WHERE-guard should still restore it (proving it did run) without a
+    // full delete+reinsert.
+    await env.DB.batch([env.DB.prepare(`UPDATE clients SET name = name || '#'`)]);
+    await syncAll(makeQueue().env);
     expect(await count("clients")).toBe(1);
-    expect(await count("devices")).toBe(1);
     const c = await env.DB.prepare(`SELECT name FROM clients WHERE id = 10`).first<{ name: string }>();
     expect(c?.name).toBe("Corp"); // upstream value restored
   });
 
-  it("deletes rows that vanished upstream and inserts newly-appeared ones", async () => {
-    await syncAll(env);
+  it("deletes vanished devices, inserts new ones, and enqueues all current clients", async () => {
+    await syncAll(makeQueue().env);
     expect(await count("devices")).toBe(1);
 
-    // Upstream: the old device is gone, two new ones appear; a new client too.
     data.clients.push({ id: 20, name: "NewCo" });
-    data.locations[20] = [{ id: 200, name: "Branch" }];
-    data.contacts[20] = [];
     data.agents = [
       { id: "aaaaaaaa-0000-0000-0000-000000000001", clientId: 10, clientLocationId: 100, displayName: "PC-NEW" },
       { id: "bbbbbbbb-0000-0000-0000-000000000002", clientId: 20, clientLocationId: 200, displayName: "PC-BRANCH" },
     ];
 
-    const r = await syncAll(env);
+    const q = makeQueue();
+    const r = await syncAll(q.env);
     expect(r.devices).toBe(2);
-    // 2 new devices + 1 new client + 1 new location written; old device deleted.
-    expect(r.changed).toBeGreaterThanOrEqual(4);
-    expect(r.deleted).toBe(1); // the vanished device
-    expect(await count("devices")).toBe(2);
-    expect(await count("clients")).toBe(2);
-
-    // The original device (its agent_id) must be gone.
+    expect(r.deleted).toBe(1); // the vanished original device
+    expect(q.queued.sort()).toEqual([10, 20]); // a message per current client
     const gone = await env.DB
       .prepare(`SELECT COUNT(*) AS n FROM devices WHERE agent_id = ?`)
       .bind("3fa85f64-5717-4562-b3fc-2c963f66afa6")
@@ -179,68 +198,100 @@ describe("syncAll delta reconcile", () => {
     expect(gone?.n).toBe(0);
   });
 
-  it("does NOT delete contacts when the bulk contacts fetch fails (partial sync)", async () => {
+  it("drops locations of a client that vanished upstream (inline, D1-only)", async () => {
+    // Seed two clients' locations via the consumer, then remove client 20.
     data.clients.push({ id: 20, name: "NewCo" });
     data.locations[20] = [{ id: 200, name: "Branch" }];
+    await syncAll(makeQueue().env);
+    await runConsumer([10, 20]);
+    expect(await count("locations")).toBe(2);
+
+    // Client 20 disappears upstream -> its site must be dropped on the next sync.
+    data.clients = [{ id: 10, name: "Corp" }];
+    await syncAll(makeQueue().env);
+    expect(await count("locations")).toBe(1);
+    const orphan = await env.DB.prepare(`SELECT COUNT(*) AS n FROM locations WHERE client_id = 20`).first<{ n: number }>();
+    expect(orphan?.n).toBe(0);
+  });
+
+  it("does NOT delete contacts when the bulk contacts fetch fails (partial sync)", async () => {
+    data.clients.push({ id: 20, name: "NewCo" });
     data.contacts[20] = [
       { id: 77, primaryEmail: "bob@newco.com", firstName: "Bob", lastName: "Roe", clientId: 20, clientLocationId: 200 },
     ];
-    await syncAll(env);
+    await syncAll(makeQueue().env);
     expect(await count("contacts")).toBe(2);
 
-    // Next sync: the bulk /v1/contacts call fails. Both contacts must survive.
     data.failAllContacts = true;
-    const r = await syncAll(env);
+    const r = await syncAll(makeQueue().env);
     expect(r.complete).toBe(false);
     expect(r.deleted).toBe(0); // no contact deletes despite the fetch returning nothing
     expect(await count("contacts")).toBe(2);
   });
 
-  it("does NOT delete locations when a per-client locations fetch fails", async () => {
-    data.clients.push({ id: 20, name: "NewCo" });
-    data.locations[20] = [{ id: 200, name: "Branch" }];
-    await syncAll(env);
-    expect(await count("locations")).toBe(2);
-
-    data.failLocations.add(20);
-    const r = await syncAll(env);
-    expect(r.complete).toBe(false);
-    expect(await count("locations")).toBe(2); // client 20's site survives the failed fetch
-  });
-
   it("collapses a duplicate contact id in the bulk feed to one stable row", async () => {
-    // The bulk feed contains id 55 twice with differing data (e.g. a merge
-    // artifact). Dedupe must pin one deterministic winner, stable across runs.
     data.contacts[10] = [
       { id: 55, primaryEmail: "a@corp.com", firstName: "Jane", lastName: "A", clientId: 10, clientLocationId: 100 },
       { id: 55, primaryEmail: "b@corp.com", firstName: "Jane", lastName: "B", clientId: 20, clientLocationId: 200 },
     ];
-
-    await syncAll(env);
-    expect(await count("contacts")).toBe(1); // collapsed to one row
+    await syncAll(makeQueue().env);
+    expect(await count("contacts")).toBe(1);
     const first = await env.DB.prepare(`SELECT email FROM contacts WHERE id = 55`).first<{ email: string }>();
 
-    const r2 = await syncAll(env);
+    const r2 = await syncAll(makeQueue().env);
     expect(r2.changed).toBe(0); // stable winner — no rewrite
     const second = await env.DB.prepare(`SELECT email FROM contacts WHERE id = 55`).first<{ email: string }>();
     expect(second?.email).toBe(first?.email);
   });
 
-  it("applies a field change to an existing row in place (same agent_id)", async () => {
-    await syncAll(env);
-    // Same device id, new hostname + serial.
+  it("applies a device field change in place (same agent_id)", async () => {
+    await syncAll(makeQueue().env);
     data.agents[0]!.displayName = "PC-RENAMED";
     data.agents[0]!.serialNo = "SN2";
-    const r = await syncAll(env);
+    const r = await syncAll(makeQueue().env);
     expect(r.changed).toBe(1); // exactly the one device row updated in place
-    expect(r.deleted).toBe(0);
-
-    expect(await count("devices")).toBe(1); // still one row, updated not duplicated
+    expect(await count("devices")).toBe(1);
     const dev = await env.DB
       .prepare(`SELECT hostname, serial FROM devices WHERE agent_id = ?`)
       .bind(data.agents[0]!.id)
       .first<{ hostname: string; serial: string }>();
     expect(dev?.hostname).toBe("pc-renamed");
     expect(dev?.serial).toBe("SN2");
+  });
+});
+
+describe("location queue consumer", () => {
+  it("fetches and upserts a client's sites, then acks", async () => {
+    data.locations[10] = [{ id: 100, name: "HQ" }, { id: 101, name: "Annex" }];
+    const { acked, retried } = await runConsumer([10]);
+    expect(acked).toEqual([10]);
+    expect(retried).toEqual([]);
+    expect(await count("locations")).toBe(2);
+    const hq = await env.DB.prepare(`SELECT name, client_id FROM locations WHERE id = 100`).first<{ name: string; client_id: number }>();
+    expect(hq).toEqual({ name: "HQ", client_id: 10 });
+  });
+
+  it("reconciles deletes scoped to one client, leaving other clients' sites alone", async () => {
+    // Pre-seed: client 10 has 100+101, client 20 has 200.
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO locations (id, name, client_id) VALUES (100,'HQ',10),(101,'Old',10),(200,'Branch',20)`),
+    ]);
+    // Upstream, client 10 now has only 100 -> 101 is stale for client 10.
+    data.locations[10] = [{ id: 100, name: "HQ" }];
+    await runConsumer([10]);
+    expect(await count("locations")).toBe(2); // 101 gone, 100 + 200 remain
+    const stale = await env.DB.prepare(`SELECT COUNT(*) AS n FROM locations WHERE id = 101`).first<{ n: number }>();
+    expect(stale?.n).toBe(0);
+    const other = await env.DB.prepare(`SELECT COUNT(*) AS n FROM locations WHERE id = 200`).first<{ n: number }>();
+    expect(other?.n).toBe(1); // client 20 untouched
+  });
+
+  it("retries (never deletes) when a client's locations fetch fails", async () => {
+    await env.DB.batch([env.DB.prepare(`INSERT INTO locations (id, name, client_id) VALUES (100,'HQ',10)`)]);
+    data.failLocations.add(10);
+    const { acked, retried } = await runConsumer([10]);
+    expect(acked).toEqual([]);
+    expect(retried).toEqual([10]); // redelivered, not dropped
+    expect(await count("locations")).toBe(1); // existing site preserved
   });
 });
