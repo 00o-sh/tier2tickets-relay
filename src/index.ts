@@ -23,7 +23,7 @@ export default {
         return textResponse(
           200,
           `ok clients=${r.clients} locations=${r.locations} contacts=${r.contacts} devices=${r.devices} ` +
-            `changed=${r.changed} deleted=${r.deleted}`,
+            `changed=${r.changed} deleted=${r.deleted}${r.complete ? "" : " (partial: some fetches failed, deletes skipped)"}`,
         );
       } catch (err) {
         console.error("admin sync failed", describeError(err));
@@ -73,7 +73,7 @@ export default {
           .then((r) =>
             console.log(
               `cron sync ok clients=${r.clients} locations=${r.locations} contacts=${r.contacts} ` +
-                `devices=${r.devices} changed=${r.changed} deleted=${r.deleted}`,
+                `devices=${r.devices} changed=${r.changed} deleted=${r.deleted} complete=${r.complete}`,
             ),
           )
           .catch(async (err) => {

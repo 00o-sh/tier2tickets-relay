@@ -86,9 +86,9 @@ function contactName(c: PublicContactResponse): string {
   return [c.firstName ?? "", c.lastName ?? ""].join(" ").trim();
 }
 
-/** Per-table reconcile result: rows fetched, rows actually written, rows deleted. */
+/** Per-table reconcile result: mirror size, rows actually written, rows deleted. */
 export interface TableStats {
-  total: number; // rows Gorelo returned (mirrored count after the sync)
+  total: number; // the mirror's actual row count after the sync
   changed: number; // rows actually inserted or updated in D1 this run
   deleted: number; // rows removed because they vanished upstream
 }
@@ -102,6 +102,13 @@ export interface SyncStats {
   changed: number;
   /** Rows deleted this run because they disappeared from Gorelo. */
   deleted: number;
+  /**
+   * True when every Gorelo fetch succeeded. When false, a per-client
+   * locations/contacts fetch failed, so those tables were upsert-only (deletes
+   * skipped) to avoid dropping rows we merely failed to fetch — totals may
+   * include not-yet-reconciled rows until a fully-successful sync.
+   */
+  complete: boolean;
 }
 
 /**
@@ -116,27 +123,46 @@ export async function syncAll(env: Env): Promise<SyncStats> {
   const [agents, clients] = await Promise.all([client.listAgents(), client.listClients()]);
   const clientIds = clients.map((c) => c.id);
 
-  // Per-client locations + contacts (bounded concurrency).
+  // Per-client locations + contacts (bounded concurrency). A per-client fetch can
+  // fail (e.g. Gorelo rate-limits under load); if any does, the fetched set is
+  // INCOMPLETE and must NOT be treated as authoritative — otherwise the reconcile
+  // step would delete every row whose client we simply failed to fetch, then
+  // re-insert it next run (write thrash + a window of missing lookups). Track
+  // completeness and gate deletes on it below.
   const locationRows: LocationInsert[] = [];
   const contactRows: ContactInsert[] = [];
+  let locationsComplete = true;
+  let contactsComplete = true;
   await mapLimit(clientIds, FETCH_CONCURRENCY, async (cid) => {
     const [locations, contacts] = await Promise.all([
-      client.listLocations(cid).catch(() => []),
-      client.listContacts(cid).catch(() => []),
+      client.listLocations(cid).catch((err) => {
+        locationsComplete = false;
+        console.error(`sync: listLocations(${cid}) failed — skipping location deletes: ${String(err)}`);
+        return null;
+      }),
+      client.listContacts(cid).catch((err) => {
+        contactsComplete = false;
+        console.error(`sync: listContacts(${cid}) failed — skipping contact deletes: ${String(err)}`);
+        return null;
+      }),
     ]);
-    for (const l of locations) {
-      locationRows.push({ id: l.id, name: (l.name ?? "").trim(), clientId: cid });
+    if (locations) {
+      for (const l of locations) {
+        locationRows.push({ id: l.id, name: (l.name ?? "").trim(), clientId: cid });
+      }
     }
-    for (const ct of contacts) {
-      const email = (ct.primaryEmail ?? "").trim().toLowerCase();
-      if (!email) continue;
-      contactRows.push({
-        id: ct.id,
-        email,
-        name: contactName(ct),
-        clientId: ct.clientId ?? cid,
-        locationId: ct.clientLocationId ?? null,
-      });
+    if (contacts) {
+      for (const ct of contacts) {
+        const email = (ct.primaryEmail ?? "").trim().toLowerCase();
+        if (!email) continue;
+        contactRows.push({
+          id: ct.id,
+          email,
+          name: contactName(ct),
+          clientId: ct.clientId ?? cid,
+          locationId: ct.clientLocationId ?? null,
+        });
+      }
     }
   });
 
@@ -155,6 +181,8 @@ export async function syncAll(env: Env): Promise<SyncStats> {
       )
       .bind(r.id, r.name),
   );
+  // locations/contacts pass their completeness flag: when a per-client fetch
+  // failed, the row set is partial, so upsert-only (no deletes) this run.
   const locationStats = await syncTable(env.DB, "locations", "id", locationRows, (r) => r.id, (r) =>
     env.DB
       .prepare(
@@ -163,6 +191,7 @@ export async function syncAll(env: Env): Promise<SyncStats> {
          WHERE locations.name IS NOT excluded.name OR locations.client_id IS NOT excluded.client_id`,
       )
       .bind(r.id, r.name, r.clientId),
+    locationsComplete,
   );
   const contactStats = await syncTable(env.DB, "contacts", "id", contactRows, (r) => r.id, (r) =>
     env.DB
@@ -175,6 +204,7 @@ export async function syncAll(env: Env): Promise<SyncStats> {
             OR contacts.client_id IS NOT excluded.client_id OR contacts.location_id IS NOT excluded.location_id`,
       )
       .bind(r.id, r.email, r.name, r.clientId, r.locationId),
+    contactsComplete,
   );
   const deviceStats = await syncTable(env.DB, "devices", "agent_id", deviceRows, (r) => r.agentId, (r) =>
     env.DB
@@ -215,19 +245,43 @@ export async function syncAll(env: Env): Promise<SyncStats> {
     devices: deviceStats.total,
     changed: all.reduce((n, s) => n + s.changed, 0),
     deleted: all.reduce((n, s) => n + s.deleted, 0),
+    complete: locationsComplete && contactsComplete,
   };
+}
+
+/**
+ * Collapse rows sharing a key down to one deterministic winner. Gorelo can
+ * return the same contact under more than one client (or with a null clientId
+ * that falls back to the query's cid), so the raw row list — built by concurrent
+ * per-client fetches — can hold several entries for one id in a run-dependent
+ * order. Without this, the "last writer wins" upsert flip-flops that row's
+ * client/location every sync (endless `changed` churn). Picking the smallest
+ * serialization makes the winner stable across runs regardless of fetch order.
+ */
+function dedupeByKey<T>(rows: T[], keyOf: (row: T) => string | number): T[] {
+  const byKey = new Map<string, T>();
+  for (const r of rows) {
+    const k = String(keyOf(r));
+    const cur = byKey.get(k);
+    if (cur === undefined || JSON.stringify(r) < JSON.stringify(cur)) byKey.set(k, r);
+  }
+  return [...byKey.values()];
 }
 
 /**
  * Reconcile `table` against `rows` without a full rewrite:
  *  1. Upsert every fetched row (the caller's stmt guards ON CONFLICT on a real
  *     diff, so unchanged rows write nothing).
- *  2. Read back the surviving keys and DELETE only those that vanished upstream.
+ *  2. When `canDelete`, read back the surviving keys and DELETE only those that
+ *     vanished upstream. `canDelete` is false when the caller's fetch was partial
+ *     (a per-client failure) — deleting then would drop rows we merely failed to
+ *     fetch, so we upsert-only and let a later complete sync reconcile.
  * Net D1 writes per sync = (new + changed rows) + (removed rows) — zero when the
  * upstream data is unchanged, vs. a full-table rewrite every run before.
  *
- * Returns row counts: `total` fetched, `changed` actually written (D1 reports
- * `meta.changes = 0` when the WHERE-guarded upsert is a no-op) and `deleted`.
+ * Returns row counts: `total` (the mirror's actual row count after the sync),
+ * `changed` actually written (D1 reports `meta.changes = 0` when the
+ * WHERE-guarded upsert is a no-op) and `deleted`.
  */
 async function syncTable<T>(
   db: D1Database,
@@ -236,27 +290,34 @@ async function syncTable<T>(
   rows: T[],
   keyOf: (row: T) => string | number,
   toStmt: (row: T) => D1PreparedStatement,
+  canDelete = true,
 ): Promise<TableStats> {
+  const deduped = dedupeByKey(rows, keyOf);
   let changed = 0;
-  for (const part of chunk(rows, INSERT_CHUNK)) {
+  for (const part of chunk(deduped, INSERT_CHUNK)) {
     const stmts = part.map(toStmt);
     if (!stmts.length) continue;
     const res = await db.batch(stmts);
     for (const r of res) changed += r.meta?.changes ?? 0;
   }
 
-  // Reconcile deletes: keys present in D1 but no longer returned by Gorelo.
-  // Reading keys is cheap (D1 bills reads far below writes); the delete list is
-  // usually empty, so a steady-state sync issues no DELETE batches at all.
-  const fetched = new Set<string>(rows.map((r) => String(keyOf(r))));
+  // Current mirror keys (post-upsert). Reading keys is cheap (D1 bills reads far
+  // below writes) and also yields the true post-sync row count for `total`.
   const { results } = await db.prepare(`SELECT ${keyCol} AS k FROM ${table}`).all<{ k: unknown }>();
-  const stale = (results ?? [])
-    .map((row) => row.k)
-    .filter((k): k is string | number => k != null && !fetched.has(String(k)));
-  for (const part of chunk(stale, INSERT_CHUNK)) {
-    if (!part.length) continue;
-    const placeholders = part.map(() => "?").join(", ");
-    await db.batch([db.prepare(`DELETE FROM ${table} WHERE ${keyCol} IN (${placeholders})`).bind(...part)]);
+  const dbKeys = (results ?? []).map((row) => row.k).filter((k) => k != null) as (string | number)[];
+
+  let deleted = 0;
+  if (canDelete) {
+    // Reconcile deletes: keys present in D1 but no longer returned by Gorelo.
+    // Usually empty, so a steady-state sync issues no DELETE batches at all.
+    const fetched = new Set<string>(deduped.map((r) => String(keyOf(r))));
+    const stale = dbKeys.filter((k) => !fetched.has(String(k)));
+    for (const part of chunk(stale, INSERT_CHUNK)) {
+      if (!part.length) continue;
+      const placeholders = part.map(() => "?").join(", ");
+      await db.batch([db.prepare(`DELETE FROM ${table} WHERE ${keyCol} IN (${placeholders})`).bind(...part)]);
+    }
+    deleted = stale.length;
   }
-  return { total: rows.length, changed, deleted: stale.length };
+  return { total: dbKeys.length - deleted, changed, deleted };
 }
