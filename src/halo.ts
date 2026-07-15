@@ -299,11 +299,13 @@ async function handleUsers(env: Env, url: URL): Promise<Response> {
 }
 
 async function handleClient(env: Env, url: URL): Promise<Response> {
-  const rows = await listClientRows(env.DB, searchTerm(url), pageSize(url));
-  // Fuller Halo "client" shape. Tier2's parser was happy with { id, name }, but a
-  // stricter Halo client (e.g. Huntress) deserializes each row into a typed model
-  // and needs the standard fields present — same lesson as haloUserFromContact.
-  // Extra fields are ignored by simpler consumers, so this stays backward-compatible.
+  const size = pageSize(url);
+  const pageNo = Number(url.searchParams.get("page_no")) || 1;
+  const rows = await listClientRows(env.DB, searchTerm(url), size);
+  // Fuller Halo "client" (Area_List) shape. Tier2's parser was happy with
+  // { id, name }, but a stricter Halo client (e.g. Huntress) deserializes each row
+  // into a typed model and needs the standard fields present. Extra fields are
+  // ignored by simpler consumers, so this stays backward-compatible.
   const clients = rows.map((c) => ({
     id: c.id,
     name: c.name ?? "",
@@ -313,7 +315,10 @@ async function handleClient(env: Env, url: URL): Promise<Response> {
     toplevel_name: "",
     use: "client",
   }));
-  return jsonResponse(200, { clients, record_count: clients.length });
+  // Envelope mirrors Halo's Area_View (docs/halo-swagger.v2.json): a paginating
+  // client reads page_no/page_size back to drive its paging loop, so echo them —
+  // omitting them left those undefined on Huntress's side.
+  return jsonResponse(200, { page_no: pageNo, page_size: size, record_count: clients.length, clients });
 }
 
 async function handleSite(env: Env, url: URL): Promise<Response> {
