@@ -136,6 +136,7 @@ HALO_TOKEN_ENFORCE = "enforce"
 #   HALO_CLIENT_ID          — tier2's client_id (its var is un-suffixed; secret is HALO_CLIENT_SECRET)
 #   HALO_CLIENT_ID_HUNTRESS — Huntress's client_id (e.g. "13b3832f9306b677fb72eea412da5df7")
 # Generate a pair + push the secret with:  ./scripts/halo-cred.sh <product>
+#   (Windows PowerShell: ./scripts/halo-cred.ps1 <product>)
 # HALO_CLIENT_ID_HUNTRESS = "13b3832f9306b677fb72eea412da5df7"
 
 # --- Secrets (set via CLI, never committed) ---
@@ -145,6 +146,7 @@ HALO_TOKEN_ENFORCE = "enforce"
 #                                           #   e.g. "ntfy://alerts" | Teams Workflows "workflows://…&sig=…" — comma/space separated
 # Per-product Halo mock OAuth secrets (issue #51) — one client_secret per product,
 # paired with the client_id var above. Easiest: ./scripts/halo-cred.sh <product>
+#   (Windows PowerShell: ./scripts/halo-cred.ps1 <product>)
 #   wrangler secret put HALO_CLIENT_SECRET          # tier2's client_secret (validated with HALO_CLIENT_ID)
 #   wrangler secret put HALO_CLIENT_SECRET_HUNTRESS # Huntress's client_secret (validated with HALO_CLIENT_ID_HUNTRESS)
 

@@ -66,7 +66,7 @@ Cron (every 6h) / POST /admin/sync / first-call bootstrap ──▶ syncAll() de
 | `docs/halo-swagger.v2.json` | the real HaloPSA OpenAPI spec — reference for shaping mock responses |
 | `migrations/0001_init.sql` | D1 schema (also self-created at runtime) |
 | `scripts/gorelo-ids.sh` | dump groups/types/statuses/clients to fill the vars |
-| `scripts/halo-cred.sh` | generate a per-product Halo OAuth pair, push the secret via `wrangler secret put`, print the creds |
+| `scripts/halo-cred.sh` / `.ps1` | generate a per-product Halo OAuth pair, push the secret via `wrangler secret put`, print the creds (Bash and PowerShell) |
 | `test/` | vitest specs (`@cloudflare/vitest-pool-workers`) |
 
 ## Deploy
@@ -98,6 +98,7 @@ wrangler secret put GORELO_API_KEY     # X-API-Key for Gorelo (ticket write + as
 wrangler secret put ADMIN_KEY          # gates POST /admin/sync
 # Per-product Halo mock OAuth secrets (issue #51) — one client_secret per product,
 # paired with its (non-secret) client_id var. Easiest: ./scripts/halo-cred.sh <product>
+# (Windows: ./scripts/halo-cred.ps1 <product>)
 wrangler secret put HALO_CLIENT_SECRET          # optional: tier2's client_secret (validated with HALO_CLIENT_ID)
 wrangler secret put HALO_CLIENT_SECRET_HUNTRESS # optional: Huntress's client_secret (validated with HALO_CLIENT_ID_HUNTRESS)
 
@@ -123,8 +124,8 @@ Configure Tier2 as a **HaloPSA — Cloud Hosted** integration:
    pair (tier2 → `HALO_CLIENT_ID`/`HALO_CLIENT_SECRET`), the token endpoint validates
    them; otherwise any credentials are accepted. (The on-prem `client_id:client_secret`
    form is tolerated too.) Generate a pair and push the secret with
-   `./scripts/halo-cred.sh tier2`, then paste the printed `client_id`/`client_secret`
-   here.
+   `./scripts/halo-cred.sh tier2` (Windows: `./scripts/halo-cred.ps1 tier2`), then
+   paste the printed `client_id`/`client_secret` here.
 4. Press **Integration Test** / do a real press — the Worker answers the OAuth +
    lookup + create + note sequence, and a Gorelo ticket appears.
 
@@ -301,7 +302,7 @@ works with **multiple products at once** — each passes with its own token, and
 product's token can't authorize another's request. A product whose pair is **unset**
 stays lenient (any creds accepted, no enforcement), so products can be onboarded /
 rolled out independently. Generate a pair and push its secret with
-`./scripts/halo-cred.sh <product>`.
+`./scripts/halo-cred.sh <product>` (or `./scripts/halo-cred.ps1 <product>` on Windows).
 
 ## Data store & refresh
 
