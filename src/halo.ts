@@ -22,6 +22,7 @@ import { breadcrumb, debug, debugOn, describeError } from "./log.js";
 import { normalizeEmail, normalizeHost } from "./parse.js";
 import { assetNum, syncAll } from "./sync.js";
 import { ipAllowed, matchProduct, type Product } from "./products.js";
+import { haloPriority, haloStatus, haloTeam, haloTicketType } from "./haloShapes.js";
 import { signToken, verifyTokenResult } from "./token.js";
 import type {
   CreatePublicTicketCommand,
@@ -227,6 +228,22 @@ function pageSize(url: URL, fallback = 100, max = 5000): number {
   return Number.isInteger(n) && n > 0 ? Math.min(n, max) : fallback;
 }
 
+/**
+ * Halo's `*_View` list envelope: `{ page_no, page_size, record_count, columns, <items> }`.
+ * A paginating Halo client (Huntress) reads page_no/page_size back to drive its loop,
+ * so every wrapped list endpoint (Client/Site/Asset/Users) must echo them — omitting
+ * them was what crashed Huntress on /Client. `extra` carries the entity array (e.g.
+ * `{ clients }`) plus its `record_count` and any endpoint-specific arrays.
+ */
+function listEnvelope(url: URL, extra: Record<string, unknown>): Record<string, unknown> {
+  return {
+    page_no: Number(url.searchParams.get("page_no")) || 1,
+    page_size: pageSize(url),
+    columns: [],
+    ...extra,
+  };
+}
+
 /** Grab the search term Tier2 sent (Halo uses `search`; also accept an email-ish param). */
 function searchTerm(url: URL): string {
   const s = url.searchParams.get("search");
@@ -278,7 +295,7 @@ async function handleUsers(env: Env, url: URL): Promise<Response> {
       client_id: Number(env.CATCHALL_CLIENT_ID),
       site_id: 0,
     });
-    return jsonResponse(200, { users: [user], record_count: 1 });
+    return jsonResponse(200, listEnvelope(url, { record_count: 1, users: [user], user_ids: [] }));
   }
 
   const rows = email.includes("@")
@@ -295,13 +312,11 @@ async function handleUsers(env: Env, url: URL): Promise<Response> {
       }),
     ),
   );
-  return jsonResponse(200, { users, record_count: users.length });
+  return jsonResponse(200, listEnvelope(url, { record_count: users.length, users, user_ids: [] }));
 }
 
 async function handleClient(env: Env, url: URL): Promise<Response> {
-  const size = pageSize(url);
-  const pageNo = Number(url.searchParams.get("page_no")) || 1;
-  const rows = await listClientRows(env.DB, searchTerm(url), size);
+  const rows = await listClientRows(env.DB, searchTerm(url), pageSize(url));
   // Fuller Halo "client" (Area_List) shape. Tier2's parser was happy with
   // { id, name }, but a stricter Halo client (e.g. Huntress) deserializes each row
   // into a typed model and needs the standard fields present. Extra fields are
@@ -315,10 +330,8 @@ async function handleClient(env: Env, url: URL): Promise<Response> {
     toplevel_name: "",
     use: "client",
   }));
-  // Envelope mirrors Halo's Area_View (docs/halo-swagger.v2.json): a paginating
-  // client reads page_no/page_size back to drive its paging loop, so echo them —
-  // omitting them left those undefined on Huntress's side.
-  return jsonResponse(200, { page_no: pageNo, page_size: size, record_count: clients.length, clients });
+  // Envelope mirrors Halo's Area_View (docs/halo-swagger.v2.json).
+  return jsonResponse(200, listEnvelope(url, { record_count: clients.length, clients }));
 }
 
 async function handleSite(env: Env, url: URL): Promise<Response> {
@@ -330,7 +343,7 @@ async function handleSite(env: Env, url: URL): Promise<Response> {
     searchTerm(url),
   );
   const sites = rows.map((l) => ({ id: l.id, name: l.name ?? "", client_id: l.client_id ?? 0 }));
-  return jsonResponse(200, { sites, record_count: sites.length });
+  return jsonResponse(200, listEnvelope(url, { record_count: sites.length, sites }));
 }
 
 async function handleAsset(env: Env, url: URL): Promise<Response> {
@@ -349,73 +362,38 @@ async function handleAsset(env: Env, url: URL): Promise<Response> {
     site_id: d.location_id ?? 0,
     inactive: false,
   }));
-  return jsonResponse(200, { assets, record_count: assets.length });
+  return jsonResponse(200, listEnvelope(url, { record_count: assets.length, assets }));
 }
 
 /**
- * A full Halo TStatus_List object (docs/halo-swagger.v2.json). Tier2 only reads
- * id/name, but a stricter Halo client (Huntress) deref's several fields on each
- * status when building its config editor, so every field is present (defaulted)
- * to avoid a client-side undefined access. `/Status` is a bare array in Halo.
+ * Config lookup lists. Halo returns these as BARE ARRAYS of full objects (no
+ * envelope, unlike /Client). Each item is the full Halo shape (src/haloShapes.ts,
+ * derived from the swagger) so a strict client's editor can't hit an undefined
+ * field or filter the list to empty. These are picker options only — ticket
+ * creation still uses the DEFAULT_* ids from wrangler.toml.
  */
-function haloStatus(id: number, name: string): Record<string, unknown> {
-  return {
-    id,
-    guid: "",
-    intent: "",
-    name,
-    shortname: name,
-    type: 0,
-    sequence: id,
-    colour: "",
-    slaaction: "",
-    ticket_count: 0,
-    showonquickchange: true,
-    timeuntilloffhold: 0,
-    statuschangeto: 0,
-    statuschangetofreq: 0,
-    useworkinghours: 0,
-    statusemailfreqdays: 0,
-    statusemailid: 0,
-    statusemail_guid: "",
-    statusnochangehours: 0,
-    nochangehoursrecurring: false,
-    statusnochangehoursmanager: 0,
-    statusnochangehoursmanagerrecurring: false,
-    statusnochangehourssection: 0,
-    statusnochangehourssectionrecurring: false,
-    nochangetemplate: 0,
-    nochangetemplate_guid: "",
-    includeinloadbalance: false,
-    useworkinghours_statusnochangehours: 0,
-    useworkinghours_statusnochangehourssection: 0,
-    useworkinghours_statusnochangehoursmanager: 0,
-  };
-}
-
-/** Minimal config lists so Tier2 can resolve default ids. Refine from captures. */
 function handleConfig(env: Env, resource: string): Response {
   switch (resource) {
     case "tickettype":
     case "tickettypes":
-      return jsonResponse(200, [{ id: Number(env.DEFAULT_TYPE_ID), name: "Incident" }]);
+      return jsonResponse(200, [haloTicketType(Number(env.DEFAULT_TYPE_ID), "Incident")]);
     case "status":
     case "statuses":
       return jsonResponse(200, [haloStatus(Number(env.DEFAULT_STATUS_ID), "New")]);
     case "team":
     case "teams":
-      return jsonResponse(200, [{ id: Number(env.DEFAULT_GROUP_ID), name: "Everyone" }]);
+      return jsonResponse(200, [haloTeam(Number(env.DEFAULT_GROUP_ID), "Everyone")]);
     case "priority":
     case "priorities":
       return jsonResponse(200, [
-        { id: 1, name: "Critical" },
-        { id: 2, name: "High" },
-        { id: 3, name: "Medium" },
-        { id: 4, name: "Low" },
+        haloPriority(1, "Critical"),
+        haloPriority(2, "High"),
+        haloPriority(3, "Medium"),
+        haloPriority(4, "Low"),
       ]);
     case "agent":
     case "agents":
-      return jsonResponse(200, { agents: [], record_count: 0 });
+      return jsonResponse(200, { agents: [], record_count: 0, page_no: 1, page_size: 100 });
     default:
       return jsonResponse(200, []);
   }

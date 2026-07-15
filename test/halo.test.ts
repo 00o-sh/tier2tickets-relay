@@ -298,12 +298,17 @@ describe("Halo lookups (Gorelo-backed)", () => {
     expect(j.users[0]).toMatchObject({ id: 999999999, client_id: 999 });
   });
 
-  it("GET /api/Site filters by client_id", async () => {
+  it("GET /api/Site filters by client_id, wrapped in the paging envelope", async () => {
     const res = await req("/api/Site?client_id=10");
-    expect(await res.json()).toEqual({
-      sites: [{ id: 100, name: "HQ", client_id: 10 }],
-      record_count: 1,
-    });
+    const j = (await res.json()) as {
+      sites: Array<Record<string, unknown>>;
+      record_count: number;
+      page_no: number;
+      page_size: number;
+    };
+    expect(j).toMatchObject({ record_count: 1, page_no: 1 });
+    expect(typeof j.page_size).toBe("number"); // paging fields present (Site_View)
+    expect(j.sites).toEqual([{ id: 100, name: "HQ", client_id: 10 }]);
   });
 
   it("GET /api/Asset returns the device with its numeric surrogate id", async () => {
@@ -312,9 +317,21 @@ describe("Halo lookups (Gorelo-backed)", () => {
     expect(j.assets[0]).toMatchObject({ id: ASSET_NUM, inventory_number: "pc-01", client_id: 10 });
   });
 
-  it("GET /api/TicketType returns a default type", async () => {
+  it("GET /api/TicketType returns a bare array of full-shape ticket types", async () => {
     const res = await req("/api/TicketType");
-    expect(await res.json()).toEqual([{ id: 3, name: "Incident" }]);
+    const j = (await res.json()) as Array<Record<string, unknown>>;
+    expect(Array.isArray(j)).toBe(true); // bare array (no envelope) — matches Halo
+    expect(j[0]).toMatchObject({ id: 3, name: "Incident", cancreate: true, agentscanselect: true });
+    // Full shape: many fields present so a strict client can't hit undefined.
+    expect(Object.keys(j[0]!).length).toBeGreaterThan(20);
+  });
+
+  it("GET /api/Status and /api/Team return full-shape bare arrays", async () => {
+    const status = (await (await req("/api/Status")).json()) as Array<Record<string, unknown>>;
+    expect(status[0]).toMatchObject({ id: 1, name: "New", intent: "" });
+    expect(Object.keys(status[0]!).length).toBeGreaterThan(20);
+    const team = (await (await req("/api/Team")).json()) as Array<Record<string, unknown>>;
+    expect(team[0]).toMatchObject({ name: "Everyone", forrequests: true });
   });
 });
 
