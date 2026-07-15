@@ -4,43 +4,60 @@ import type { Env } from "./types.js";
 /**
  * A source product whose Halo integration posts into this relay. Access is
  * gated by matching the request's `CF-Connecting-IP` against the product's exact
- * IPs or CIDR ranges. `key` is the token used in the ENABLED_PRODUCTS env var.
+ * IPs or CIDR ranges. Each product is toggled by its own `ENABLE_*` env flag
+ * (`enableVar`); `defaultEnabled` is the value used when that flag is unset.
  */
 export interface Product {
   key: string;
   label: string;
+  enableVar: keyof Env; // the "ENABLE_*" var that toggles this product
+  defaultEnabled: boolean; // value when enableVar is unset/empty
   ips: Set<string>; // exact source IPs
   cidrs: string[]; // IPv4 CIDR ranges ("a.b.c.d/len")
 }
 
 /**
  * Registry of known source products. To onboard a product: add its exact IPs
- * and/or CIDR ranges here, then enable it at runtime via ENABLED_PRODUCTS in
- * wrangler.toml. NOTE: allowlisting a product's IPs is only the doorman — the
- * downstream ticket-building path (buildHaloDescription / HDB report parsing) is
- * still Tier2/Helpdesk-Buttons-shaped, so a newly enabled product needs its own
- * field handling before it produces correct Gorelo tickets. `matchProduct`
- * returns the matched product precisely so that handling can branch on it later.
+ * and/or CIDR ranges here with an `ENABLE_<KEY>` flag (also declared on Env and
+ * documented in wrangler.toml). NOTE: allowlisting a product's IPs is only the
+ * doorman — the downstream ticket-building path (buildHaloDescription / HDB
+ * report parsing) is still Tier2/Helpdesk-Buttons-shaped, so a newly enabled
+ * product needs its own field handling before it produces correct Gorelo
+ * tickets. `matchProduct` returns the matched product precisely so that handling
+ * can branch on it later.
  */
 export const PRODUCTS: Record<string, Product> = {
-  // Tier2Tickets / Helpdesk Buttons cloud — the original integration.
+  // Tier2Tickets / Helpdesk Buttons cloud — the original integration. On by default.
   tier2: {
     key: "tier2",
     label: "Tier2Tickets / Helpdesk Buttons",
+    enableVar: "ENABLE_TIER2",
+    defaultEnabled: true,
     ips: new Set(["34.202.14.153", "3.209.57.193"]),
     cidrs: [],
   },
-  // Huntress — additional source IPs + /28 ranges. Opt-in via ENABLED_PRODUCTS.
+  // Huntress — additional source IPs + /28 ranges. Opt-in (off by default).
   huntress: {
     key: "huntress",
     label: "Huntress",
+    enableVar: "ENABLE_HUNTRESS",
+    defaultEnabled: false,
     ips: new Set(["52.4.130.244", "34.205.224.75", "184.72.103.99", "107.21.187.4"]),
     cidrs: ["4.150.82.176/28", "172.200.220.176/28"],
   },
 };
 
-/** Product(s) enabled when ENABLED_PRODUCTS is unset/empty (backward-compatible default). */
-const DEFAULT_ENABLED = ["tier2"];
+/**
+ * Interpret an `ENABLE_*` flag. "true"/"1"/"yes"/"on" (case-insensitive) enable;
+ * any other non-empty value disables; unset or empty falls back to `dflt` so a
+ * missing var can't accidentally flip a product's built-in default.
+ */
+function flagOn(raw: string | undefined, dflt: boolean): boolean {
+  if (raw === undefined) return dflt;
+  const v = raw.trim().toLowerCase();
+  if (v === "") return dflt;
+  return v === "true" || v === "1" || v === "yes" || v === "on";
+}
 
 /** Parse a dotted-quad IPv4 string to a 32-bit unsigned int, or null if malformed. */
 function ipv4ToInt(ip: string): number | null {
@@ -71,21 +88,16 @@ export function ipInCidr(ip: string, cidr: string): boolean {
 }
 
 /**
- * Resolve ENABLED_PRODUCTS (comma/space-separated product keys) to Product
- * objects. Unset/empty defaults to Tier2 alone so behavior is unchanged until
- * other products are explicitly opted in. Unknown keys are ignored with a
- * breadcrumb so a typo can't silently widen or narrow access.
+ * The currently-enabled products — those whose `ENABLE_*` flag resolves on. A
+ * breadcrumb is logged when everything is disabled, since (with the allowlist
+ * enforced) that closes the door to all inbound Halo traffic.
  */
 export function enabledProducts(env: Env): Product[] {
-  const raw = (env.ENABLED_PRODUCTS ?? "").trim();
-  const keys = raw ? raw.split(/[\s,]+/).filter(Boolean) : DEFAULT_ENABLED;
-  const out: Product[] = [];
-  for (const k of keys) {
-    const p = PRODUCTS[k.toLowerCase()];
-    if (p) out.push(p);
-    else breadcrumb(`ENABLED_PRODUCTS: unknown product "${k}" — ignored`);
-  }
-  return out;
+  const on = Object.values(PRODUCTS).filter((p) =>
+    flagOn(env[p.enableVar] as string | undefined, p.defaultEnabled),
+  );
+  if (on.length === 0) breadcrumb("no products enabled — all inbound Halo IPs will be rejected");
+  return on;
 }
 
 /**
@@ -109,7 +121,7 @@ export function matchProduct(request: Request, env: Env): Product | null {
  * default. Only an explicit, normalized `"false"`, `"0"`, or `""` disables it —
  * an unset var, `"true"`, `"True"`, or any other value enforces. Enforcement
  * matches `CF-Connecting-IP` against the exact IPs and CIDR ranges of the
- * currently ENABLED_PRODUCTS; the header is Cloudflare-controlled and an absent
+ * currently-enabled products; the header is Cloudflare-controlled and an absent
  * header already fails closed (it matches no product).
  */
 export function ipAllowed(request: Request, env: Env): boolean {
