@@ -14,6 +14,12 @@ export interface Product {
   defaultEnabled: boolean; // value when enableVar is unset/empty
   ips: Set<string>; // exact source IPs
   cidrs: string[]; // IPv4 CIDR ranges ("a.b.c.d/len")
+  // Optional second gate: a case-insensitive substring the request's User-Agent
+  // must contain. IP membership is ALWAYS required; when userAgent is set the UA
+  // must ALSO match (IP AND UA). Left undefined => IP-only (no UA requirement).
+  // UA is client-controlled/spoofable, so it only tightens an IP-passing request,
+  // never widens access.
+  userAgent?: string;
 }
 
 /**
@@ -37,6 +43,7 @@ export const PRODUCTS: Record<string, Product> = {
     cidrs: [],
   },
   // Huntress — additional source IPs + /28 ranges. Opt-in (off by default).
+  // Gated on IP AND its self-declared User-Agent ("Huntress Halo Integration").
   huntress: {
     key: "huntress",
     label: "Huntress",
@@ -44,6 +51,7 @@ export const PRODUCTS: Record<string, Product> = {
     defaultEnabled: false,
     ips: new Set(["52.4.130.244", "34.205.224.75", "184.72.103.99", "107.21.187.4"]),
     cidrs: ["4.150.82.176/28", "172.200.220.176/28"],
+    userAgent: "Huntress Halo Integration",
   },
 };
 
@@ -109,8 +117,12 @@ export function enabledProducts(env: Env): Product[] {
 export function matchProduct(request: Request, env: Env): Product | null {
   const ip = request.headers.get("CF-Connecting-IP") ?? "";
   if (!ip) return null;
+  const ua = (request.headers.get("User-Agent") ?? "").toLowerCase();
   for (const p of enabledProducts(env)) {
-    if (p.ips.has(ip) || p.cidrs.some((c) => ipInCidr(ip, c))) return p;
+    const ipOk = p.ips.has(ip) || p.cidrs.some((c) => ipInCidr(ip, c));
+    if (!ipOk) continue; // IP membership is always mandatory
+    if (p.userAgent && !ua.includes(p.userAgent.toLowerCase())) continue; // optional UA second gate
+    return p;
   }
   return null;
 }

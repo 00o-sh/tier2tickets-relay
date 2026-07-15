@@ -1183,7 +1183,7 @@ export async function handleHalo(
   const body = await logCapture(request, url, env);
 
   if (!ipAllowed(request, env)) {
-    breadcrumb("HALO rejected: source IP not allowlisted");
+    breadcrumb("HALO rejected: no enabled product matched (source IP / User-Agent)");
     return jsonResponse(403, { error: "forbidden" });
   }
 
