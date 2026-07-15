@@ -264,9 +264,19 @@ describe("Halo routing to real Tier2 paths (no /api prefix)", () => {
 });
 
 describe("Halo lookups (Gorelo-backed)", () => {
-  it("GET /api/Client returns mirrored clients", async () => {
+  it("GET /api/Client returns mirrored clients in the fuller Halo shape", async () => {
     const res = await req("/api/Client?search=corp");
-    expect(await res.json()).toEqual({ clients: [{ id: 10, name: "Corp" }], record_count: 1 });
+    const j = (await res.json()) as { clients: Array<Record<string, unknown>>; record_count: number };
+    expect(j.record_count).toBe(1);
+    expect(j.clients).toHaveLength(1);
+    // id/name preserved for existing consumers; standard Halo fields added for stricter ones.
+    expect(j.clients[0]).toMatchObject({
+      id: 10,
+      name: "Corp",
+      inactive: false,
+      use: "client",
+      toplevel_id: 0,
+    });
   });
 
   it("GET /api/Users resolves a contact by email", async () => {

@@ -221,6 +221,12 @@ async function handleToken(request: Request, env: Env, url: URL, body: string): 
 
 // --- Lookups (GET) ----------------------------------------------------------
 
+/** Honor Halo's `page_size` (bounded), defaulting to the prior 100-row cap when absent. */
+function pageSize(url: URL, fallback = 100, max = 5000): number {
+  const n = Number(url.searchParams.get("page_size"));
+  return Number.isInteger(n) && n > 0 ? Math.min(n, max) : fallback;
+}
+
 /** Grab the search term Tier2 sent (Halo uses `search`; also accept an email-ish param). */
 function searchTerm(url: URL): string {
   const s = url.searchParams.get("search");
@@ -293,8 +299,20 @@ async function handleUsers(env: Env, url: URL): Promise<Response> {
 }
 
 async function handleClient(env: Env, url: URL): Promise<Response> {
-  const rows = await listClientRows(env.DB, searchTerm(url));
-  const clients = rows.map((c) => ({ id: c.id, name: c.name ?? "" }));
+  const rows = await listClientRows(env.DB, searchTerm(url), pageSize(url));
+  // Fuller Halo "client" shape. Tier2's parser was happy with { id, name }, but a
+  // stricter Halo client (e.g. Huntress) deserializes each row into a typed model
+  // and needs the standard fields present — same lesson as haloUserFromContact.
+  // Extra fields are ignored by simpler consumers, so this stays backward-compatible.
+  const clients = rows.map((c) => ({
+    id: c.id,
+    name: c.name ?? "",
+    colour: "",
+    inactive: false,
+    toplevel_id: 0,
+    toplevel_name: "",
+    use: "client",
+  }));
   return jsonResponse(200, { clients, record_count: clients.length });
 }
 
