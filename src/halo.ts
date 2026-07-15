@@ -379,7 +379,16 @@ function handleConfig(env: Env, resource: string): Response {
       return jsonResponse(200, [haloTicketType(Number(env.DEFAULT_TYPE_ID), "Incident")]);
     case "status":
     case "statuses":
-      return jsonResponse(200, [haloStatus(Number(env.DEFAULT_STATUS_ID), "New")]);
+      // A realistic open->closed spread (not just "New"): a PSA editor maps a
+      // "new" AND a "closed/resolved" status, and a single status crashes the
+      // closed-side lookup. type: 0=open, 1=pending, 2=closed; intent mirrors it.
+      // Creation still uses DEFAULT_STATUS_ID; these are picker options.
+      return jsonResponse(200, [
+        haloStatus(Number(env.DEFAULT_STATUS_ID) || 1, "New", 0, "open"),
+        haloStatus(2, "In Progress", 0, "open"),
+        haloStatus(3, "Resolved", 2, "closed"),
+        haloStatus(4, "Closed", 2, "closed"),
+      ]);
     case "team":
     case "teams":
       return jsonResponse(200, [haloTeam(Number(env.DEFAULT_GROUP_ID), "Everyone")]);

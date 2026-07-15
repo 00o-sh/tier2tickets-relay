@@ -7,15 +7,21 @@
 // (which would crash a `list[0]` deref). These are picker options only; ticket creation
 // still uses the DEFAULT_* ids from wrangler.toml.
 
-/** Full Halo TStatus_List object. */
-export function haloStatus(id: number, name: string): Record<string, unknown> {
+/**
+ * Full Halo TStatus_List object. `type` categorizes the status (Halo uses it for
+ * open/pending/closed, driving the `excludeclosed`/`excludepending` filters): a
+ * PSA integration editor reads it to offer both a "new" and a "closed/resolved"
+ * status, so the list must span those categories or the closed-side lookup returns
+ * undefined and crashes. `intent` carries a matching hint for name-based clients.
+ */
+export function haloStatus(id: number, name: string, type = 0, intent = ""): Record<string, unknown> {
   return {
     id,
     guid: "",
-    intent: "",
+    intent,
     name,
     shortname: name,
-    type: 0,
+    type,
     sequence: id,
     colour: "",
     slaaction: "",

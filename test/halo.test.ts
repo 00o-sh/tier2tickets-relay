@@ -326,10 +326,15 @@ describe("Halo lookups (Gorelo-backed)", () => {
     expect(Object.keys(j[0]!).length).toBeGreaterThan(20);
   });
 
-  it("GET /api/Status and /api/Team return full-shape bare arrays", async () => {
+  it("GET /api/Status returns a full-shape open->closed status set", async () => {
     const status = (await (await req("/api/Status")).json()) as Array<Record<string, unknown>>;
-    expect(status[0]).toMatchObject({ id: 1, name: "New", intent: "" });
+    expect(status[0]).toMatchObject({ id: 1, name: "New", type: 0, intent: "open" });
     expect(Object.keys(status[0]!).length).toBeGreaterThan(20);
+    // A closed/resolved status must exist or a PSA editor's closed-side lookup crashes.
+    expect(status.some((s) => s.type === 2 && /closed|resolved/i.test(String(s.name)))).toBe(true);
+  });
+
+  it("GET /api/Team returns a full-shape bare array", async () => {
     const team = (await (await req("/api/Team")).json()) as Array<Record<string, unknown>>;
     expect(team[0]).toMatchObject({ name: "Everyone", forrequests: true });
   });
