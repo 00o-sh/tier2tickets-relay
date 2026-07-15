@@ -17,6 +17,9 @@ export interface Env {
   // vars
   GORELO_BASE_URL: string;
   ENFORCE_IP_ALLOWLIST: string; // "true" | "false"
+  // Comma/space-separated source-product keys whose IPs are allowlisted (see
+  // src/products.ts PRODUCTS). Unset/empty => "tier2" alone (backward-compatible).
+  ENABLED_PRODUCTS?: string;
   DEFAULT_GROUP_ID: string; // int as string
   DEFAULT_TYPE_ID: string; // int as string
   DEFAULT_STATUS_ID: string; // int as string (REQUIRED by Gorelo's validator)

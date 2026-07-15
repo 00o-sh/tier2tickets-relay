@@ -21,7 +21,7 @@ import { GoreloClient, GoreloError, extractTicketNumber } from "./gorelo.js";
 import { breadcrumb, debug, debugOn, describeError } from "./log.js";
 import { normalizeEmail, normalizeHost } from "./parse.js";
 import { assetNum, syncAll } from "./sync.js";
-import { ipAllowed } from "./tier2.js";
+import { ipAllowed } from "./products.js";
 import { signToken, verifyTokenResult } from "./token.js";
 import type {
   CreatePublicTicketCommand,

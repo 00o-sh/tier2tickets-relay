@@ -48,8 +48,18 @@ max_retries = 3
 # US: https://api.usw.gorelo.io   AU: https://api.aue.gorelo.io
 GORELO_BASE_URL = "https://api.usw.gorelo.io"
 
-# When "true", only Tier2's two fixed source IPs (via CF-Connecting-IP) may POST tickets.
+# When "true" (default), only the source IPs of the ENABLED_PRODUCTS below (matched
+# via CF-Connecting-IP) may POST tickets. "false"/"0"/"" disables the allowlist.
 ENFORCE_IP_ALLOWLIST = "true"
+
+# Comma/space-separated source-product keys whose IPs are allowlisted. Keys are
+# defined in src/products.ts (PRODUCTS): currently "tier2" and "huntress".
+# Unset/empty => "tier2" alone, preserving the original behavior. Add "huntress"
+# (e.g. "tier2 huntress") to allow Huntress's source IPs/CIDR ranges through.
+# NOTE: this is only the IP doorman — the ticket-building path is still
+# Tier2/Helpdesk-Buttons-shaped, so an enabled product needs its own field
+# handling before its requests produce correct Gorelo tickets.
+ENABLED_PRODUCTS = "tier2"
 
 # --- Gorelo IDs: fill these from scripts/gorelo-ids.sh (values below are from the live Salient tenant) ---
 # groupId / typeId / priorityId / sourceId are NON-NULLABLE on CreatePublicTicketCommand
